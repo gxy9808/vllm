@@ -42,6 +42,21 @@ def build_args(args: list[str]) -> dict[str, str]:
     return values
 
 
+def exact_requirements(path: str) -> dict[str, str]:
+    requirements = {}
+    for line in (REPO_ROOT / path).read_text().splitlines():
+        if not line or line[0].isspace() or line.startswith("#"):
+            continue
+        name, separator, version = line.partition("==")
+        assert separator and name and version, f"Unpinned requirement in {path}: {line}"
+        normalized = name.lower().replace("_", "-").replace(".", "-")
+        assert normalized not in requirements, (
+            f"Duplicate requirement in {path}: {name}"
+        )
+        requirements[normalized] = version
+    return requirements
+
+
 def test_release_metadata_args_prefer_pipeline_id() -> None:
     args = run_helper(
         "cu130-ubuntu2404",
@@ -193,10 +208,44 @@ def test_rocm_ci_base_metadata_inputs_cover_ci_base_files() -> None:
     for expected in (
         "requirements/common.txt",
         "requirements/rocm.txt",
+        "requirements/rocm-ci.txt",
+        "requirements/rocm-lmcache.txt",
         "requirements/test/rocm.txt",
         "docker/Dockerfile.rocm",
     ):
         assert expected in ci_bake
+    assert ci_bake.count("requirements/rocm-ci.txt") >= 2
+
+
+def test_rocm_image_locks_are_exact_and_compatible() -> None:
+    runtime = exact_requirements("requirements/rocm-ci.txt")
+    lmcache_delta = exact_requirements("requirements/rocm-lmcache.txt")
+    tests = exact_requirements("requirements/test/rocm.txt")
+
+    overlap = runtime.keys() & tests.keys()
+    assert overlap
+    assert all(runtime[name] == tests[name] for name in overlap)
+    assert lmcache_delta.keys().isdisjoint(runtime.keys() | tests.keys())
+
+
+def test_rocm_base_cache_keys_include_runtime_lock() -> None:
+    for path in (
+        ".buildkite/scripts/rocm/refresh-base-image.sh",
+        ".buildkite/scripts/cache-rocm-base-wheels.sh",
+    ):
+        assert "requirements/rocm-ci.txt" in (REPO_ROOT / path).read_text()
+
+
+def test_rocm_docker_stages_consume_exact_locks() -> None:
+    base = (REPO_ROOT / "docker/Dockerfile.rocm_base").read_text()
+    rocm = (REPO_ROOT / "docker/Dockerfile.rocm").read_text()
+
+    assert "pip install --constraint /tmp/rocm-ci.txt /install/*.whl" in base
+    assert "uv pip install --system --no-deps -r requirements/rocm-ci.txt" in rocm
+    assert "uv pip install --system --no-deps -r /tmp/rocm-ci.txt" in rocm
+    assert "uv pip install --system --no-deps -r /tmp/rocm-test-reqs.txt" in rocm
+    assert "requirements/rocm-lmcache.txt" in rocm
+    assert "uv pip check --system" in rocm
 
 
 def test_rocm_ci_smoke_runs_in_shared_buildkit_graph() -> None:

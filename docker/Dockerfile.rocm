@@ -280,11 +280,12 @@ WORKDIR ${COMMON_WORKDIR}/vllm
 
 COPY --from=fetch_vllm \
     ${COMMON_WORKDIR}/vllm/requirements/common.txt \
+    ${COMMON_WORKDIR}/vllm/requirements/rocm-ci.txt \
     ${COMMON_WORKDIR}/vllm/requirements/rocm.txt \
     requirements/
 
 RUN --mount=type=cache,id=vllm-rocm-uv,target=/root/.cache/uv \
-    uv pip install --system -r requirements/rocm.txt
+    uv pip install --system --no-deps -r requirements/rocm-ci.txt
 
 # Fetch only the pinned ROCm Triton kernels package. Keeping this before the
 # vLLM source COPYs makes the download reusable when native sources change.
@@ -872,7 +873,7 @@ fi
 # Install NIXL + DeepEP wheels.
 RUN --mount=type=bind,from=build_nixl,src=/app/install,target=/nixl_install \
     --mount=type=bind,from=build_deepep,src=/app/deep_install,target=/deep_install \
-    uv pip install --system /nixl_install/*.whl /deep_install/*.whl
+    uv pip install --system --no-deps /nixl_install/*.whl /deep_install/*.whl
 
 # Copy ROCShmem runtime libraries.
 COPY --from=build_rocshmem /opt/rocshmem /opt/rocshmem
@@ -898,11 +899,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     && rm /tmp/install_torchcodec.sh \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Pre-install shared ROCm runtime dependencies.
-COPY requirements/common.txt requirements/rocm.txt /tmp/ci-base-requirements/
+# Pre-install the resolved ROCm runtime dependencies.
+COPY requirements/rocm-ci.txt /tmp/rocm-ci.txt
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system -r /tmp/ci-base-requirements/rocm.txt \
-    && rm -rf /tmp/ci-base-requirements
+    uv pip install --system --no-deps -r /tmp/rocm-ci.txt
 
 # Enable fast and less brittle model downloads in tests.
 ENV HF_XET_HIGH_PERFORMANCE=1
@@ -914,7 +914,7 @@ ENV PYTORCH_NVML_BASED_CUDA_CHECK=1
 # Pre-install vLLM test dependencies.
 COPY requirements/test/rocm.txt /tmp/rocm-test-reqs.txt
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system -r /tmp/rocm-test-reqs.txt
+    uv pip install --system --no-deps -r /tmp/rocm-test-reqs.txt
 
 # Rebuild fastsafetensors from source so its C++ extension is compiled with
 # USE_ROCM and can detect libamdhip64.so at runtime.
@@ -943,14 +943,20 @@ ENV KINETO_CONFIG="${COMMON_WORKDIR}/libkineto.conf"
 # Install vllm_test_utils in ci_base for ci_base + wheel parity.
 COPY tests/vllm_test_utils /tmp/vllm_test_utils
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system /tmp/vllm_test_utils \
+    uv pip install --system --no-deps /tmp/vllm_test_utils \
     && rm -rf /tmp/vllm_test_utils
 
 RUN --mount=type=bind,from=build_lmcache,src=/app/install,target=/lmcache_install \
+    --mount=type=bind,source=requirements/rocm-ci.txt,target=/tmp/rocm-ci-constraints.txt \
+    --mount=type=bind,source=requirements/rocm-lmcache.txt,target=/tmp/lmcache-extra-constraints.txt \
     --mount=type=bind,source=requirements/test/rocm.txt,target=/tmp/lmcache-constraints.txt \
     --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system --constraint /tmp/lmcache-constraints.txt \
+    uv pip install --system \
+        --constraint /tmp/rocm-ci-constraints.txt \
+        --constraint /tmp/lmcache-extra-constraints.txt \
+        --constraint /tmp/lmcache-constraints.txt \
         /lmcache_install/*.whl \
+    && uv pip check --system \
     && python3 -c "import lmcache, lmcache.c_ops; print('lmcache', lmcache.__version__)"
 
 RUN --mount=type=bind,from=export_mooncake,src=/,target=/mooncake_install,ro \

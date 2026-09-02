@@ -124,6 +124,12 @@ repos:
       ]
       files: ^requirements/(common|rocm|test/rocm)\.(in|txt)$
     - id: pip-compile
+      alias: pip-compile-rocm-images
+      name: pip-compile-rocm-images
+      entry: bash tools/lock_rocm_requirements.sh
+      pass_filenames: false
+      files: ^(tools/lock_rocm_requirements\.sh|requirements/(common|rocm(-(ci|lmcache))?|test/rocm)\.(in|txt))$
+    - id: pip-compile
       alias: pip-compile-xpu
       name: pip-compile-xpu
       args: [

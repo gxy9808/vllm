@@ -239,8 +239,10 @@ steps:
   optional: true
   working_dir: "/vllm-workspace/tests"
   source_file_dependencies:
+  - .buildkite/scripts/cache-rocm-base-wheels.sh
   - .buildkite/scripts/docker-build-metadata-args.sh
   - .buildkite/scripts/ci-bake-rocm.sh
+  - .buildkite/scripts/rocm/refresh-base-image.sh
   - .buildkite/release-pipeline.yaml
   - docker/Dockerfile
   - docker/Dockerfile.cpu
@@ -249,8 +251,15 @@ steps:
   - docker/ci-rocm.hcl
   - docker/docker-bake.hcl
   - docker/docker-bake-rocm.hcl
+  - requirements/rocm-ci.in
+  - requirements/rocm-ci.txt
+  - requirements/rocm-lmcache.in
+  - requirements/rocm-lmcache.txt
+  - requirements/test/rocm.txt
   - tests/tools/test_docker_build_metadata_args.py
+  - tools/lock_rocm_requirements.sh
   commands:
+  - cd .. && before=$$(sha256sum requirements/rocm-ci.txt requirements/rocm-lmcache.txt) && bash tools/lock_rocm_requirements.sh && test "$$before" = "$$(sha256sum requirements/rocm-ci.txt requirements/rocm-lmcache.txt)"
   - pytest -v -s tools/test_docker_build_metadata_args.py
 
 #########################################################################################################################################

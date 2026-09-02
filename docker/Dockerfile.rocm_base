@@ -425,8 +425,11 @@ RUN cd /src/projects/rocprofiler-sdk \
     && cmake --install build --prefix /staging --strip
 
 FROM base AS final
+COPY requirements/rocm-ci.txt /tmp/rocm-ci.txt
 RUN --mount=type=bind,from=debs,src=/app/debs,target=/install \
-    pip install /install/*.whl
+    pip install --constraint /tmp/rocm-ci.txt /install/*.whl \
+    && pip check \
+    && rm -f /tmp/rocm-ci.txt
 
 COPY --from=build_rocprofiler_sdk /staging/ /opt/rocm/
 RUN ldconfig

@@ -1,0 +1,14 @@
+# vLLM ROCm runtime plus dependencies supplied by source-built Docker wheels.
+-r rocm.txt
+
+# MoRI proxy runtime.
+blinker
+quart
+msgpack
+aiohttp
+pyzmq
+
+# AITER and TorchAudio wheel metadata.
+flydsl==0.2.4
+pybind11==3.0.4
+soundfile

@@ -1,0 +1,8 @@
+aiofile==3.12.3
+awscrt==0.36.2
+caio==0.12.2
+cupy-rocm-7-0==14.2.0
+google-cloud-bigtable==2.43.0
+google-cloud-monitoring==2.31.0
+grpc-google-iam-v1==0.14.5
+grpcio-status==1.78.0

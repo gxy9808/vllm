@@ -5,7 +5,7 @@
 # Cache helper for ROCm base wheels
 #
 # This script manages caching of pre-built ROCm base wheels (torch, triton, etc.)
-# to avoid rebuilding them when Dockerfile.rocm_base hasn't changed.
+# to avoid rebuilding them when the base image inputs haven't changed.
 #
 # Usage:
 #   cache-rocm-base-wheels.sh check    - Check if cache exists, outputs "hit" or "miss"
@@ -17,7 +17,7 @@
 #   S3_BUCKET          - S3 bucket name (default: vllm-wheels)
 #
 # Note: ROCm version is determined by BASE_IMAGE in Dockerfile.rocm_base,
-#       so changes to ROCm version are captured by the Dockerfile hash.
+#       so changes to ROCm version are captured by the cache hash.
 
 set -euo pipefail
 
@@ -25,14 +25,15 @@ BUCKET="${S3_BUCKET:-vllm-wheels}"
 DOCKERFILE="docker/Dockerfile.rocm_base"
 CACHE_PREFIX="rocm/cache"
 
-# Generate hash from Dockerfile content + build args
+# Generate hash from Dockerfile content + dependency inputs
 generate_cache_key() {
-    # Include Dockerfile content
     if [[ ! -f "$DOCKERFILE" ]]; then
         echo "ERROR: Dockerfile not found: $DOCKERFILE" >&2
         exit 1
     fi
-    local dockerfile_hash=$(sha256sum "$DOCKERFILE" | cut -c1-16)
+    local dockerfile_hash
+    dockerfile_hash=$(sha256sum "$DOCKERFILE" .dockerignore requirements/rocm-ci.txt \
+        | sha256sum | cut -c1-16)
 
     echo "${dockerfile_hash}"
 }
