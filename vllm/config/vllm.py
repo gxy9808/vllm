@@ -175,6 +175,19 @@ def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
     )
 
 
+def enable_optimus_rms_fusion(cfg: "VllmConfig") -> bool:
+    """Enable the Step4 Optimus residual-add fusion at CC level 1+."""
+    from vllm.platforms import current_platform
+
+    model_config = cfg.model_config
+    return (
+        model_config is not None
+        and model_config.architecture in {"Step4ForCausalLM", "Step4MTP"}
+        and current_platform.is_cuda()
+        and envs.VLLM_STEP_CC_LEVEL >= 1
+    )
+
+
 def enable_rope_kvcache_fusion(cfg: "VllmConfig") -> bool:
     """Enable if rotary embedding custom op is active and
     use_inductor_graph_partition is enabled.
@@ -230,6 +243,7 @@ OPTIMIZATION_LEVEL_00 = {
     "compilation_config": {
         "pass_config": {
             "fuse_norm_quant": False,
+            "fuse_optimus_rms": False,
             "fuse_act_quant": False,
             "fuse_allreduce_rms": False,
             "fuse_attn_quant": False,
@@ -253,6 +267,7 @@ OPTIMIZATION_LEVEL_01 = {
     "compilation_config": {
         "pass_config": {
             "fuse_norm_quant": enable_norm_fusion,
+            "fuse_optimus_rms": enable_optimus_rms_fusion,
             "fuse_act_quant": enable_act_fusion,
             "fuse_allreduce_rms": False,
             "fuse_attn_quant": False,
@@ -276,6 +291,7 @@ OPTIMIZATION_LEVEL_02 = {
     "compilation_config": {
         "pass_config": {
             "fuse_norm_quant": enable_norm_fusion,
+            "fuse_optimus_rms": enable_optimus_rms_fusion,
             "fuse_act_quant": enable_act_fusion,
             "fuse_allreduce_rms": enable_allreduce_rms_fusion,
             "fuse_attn_quant": IS_QUANTIZED,
@@ -299,6 +315,7 @@ OPTIMIZATION_LEVEL_03 = {
     "compilation_config": {
         "pass_config": {
             "fuse_norm_quant": enable_norm_fusion,
+            "fuse_optimus_rms": enable_optimus_rms_fusion,
             "fuse_act_quant": enable_act_fusion,
             "fuse_allreduce_rms": enable_allreduce_rms_fusion,
             "fuse_attn_quant": IS_QUANTIZED,
@@ -549,6 +566,41 @@ class VllmConfig:
                 return 2
         return pp_size
 
+    def resolve_valid_vocab_size(self, tokenizer: Any | None = None) -> Any | None:
+        """Resolve target and speculative draft vocabularies before launch."""
+        tokenizer = self.model_config.resolve_valid_vocab_size(tokenizer)
+
+        speculative_config = self.speculative_config
+        if (
+            speculative_config is not None
+            and speculative_config.draft_model_config is not None
+            and speculative_config.draft_model_config is not self.model_config
+        ):
+            draft_model_config = speculative_config.draft_model_config
+            use_heterogeneous_vocab = getattr(
+                speculative_config,
+                "use_heterogeneous_vocab",
+                False,
+            )
+            if (
+                not use_heterogeneous_vocab
+                and self.model_config.valid_vocab_size is not None
+                and draft_model_config.supports_valid_vocab_size()
+            ):
+                draft_model_config.set_valid_vocab_size(
+                    self.model_config.valid_vocab_size
+                )
+            draft_model_config.resolve_valid_vocab_size(
+                None if use_heterogeneous_vocab else tokenizer
+            )
+        if speculative_config is not None and not getattr(
+            speculative_config,
+            "use_heterogeneous_vocab",
+            False,
+        ):
+            SpeculativeConfig.verify_equal_vocab_size_if_draft_model(speculative_config)
+        return tokenizer
+
     @property
     def max_in_flight_tokens(self) -> int:
         # Upper bound on tokens that are scheduled but not yet settled (freed):
@@ -572,6 +624,33 @@ class VllmConfig:
             and self.diffusion_config.canvas_length is not None
         ):
             return self.diffusion_config.canvas_length
+        return 0
+
+    @property
+    def num_lookahead_tokens(self) -> int:
+        """KV slots to reserve past the tokens the target model is scheduled for.
+
+        The drafter writes KV for positions beyond the target model's query
+        range, so every component that reserves blocks must add this margin:
+        the scheduler through `allocate_slots`, and the worker warmup, which
+        builds its own `SchedulerOutput`s. Consumers must read this property
+        rather than re-deriving their own per-method lookahead, so the
+        scheduler and warmup cannot drift apart.
+        """
+        speculative_config = self.speculative_config
+        if speculative_config is None:
+            return 0
+        if speculative_config.use_dflash():
+            # DFlash requires an extra lookahead slot since it uses in-fill-style
+            # decoding instead of standard next-token sampling, so it has a query
+            # for the last sampled token plus queries for each draft token.
+            return self.num_speculative_tokens + 1
+        if speculative_config.use_eagle() or speculative_config.uses_draft_model():
+            # DSpark (covered by use_eagle) drafts a block of num_speculative_tokens
+            # query tokens in which the anchor itself is the first prediction
+            # position (no separate bonus query), so it needs exactly
+            # num_speculative_tokens lookahead slots.
+            return self.num_speculative_tokens
         return 0
 
     @property
@@ -2227,6 +2306,14 @@ class VllmConfig:
         if model_config is not None and model_config.enable_return_routed_experts:
             # Will be added by https://github.com/vllm-project/vllm/pull/38163
             unsupported.append("routed experts capture")
+
+        if model_config is not None and model_config.architecture in {
+            "Step4ForCausalLM",
+            "Step4MTP",
+        }:
+            # Keep Step4 fail-closed until its DSA, side-storage, and MTP
+            # paths have dedicated V2 runner coverage.
+            unsupported.append("Step4 models")
 
         has_logitsproc_plugins = False
         if model_config is not None:

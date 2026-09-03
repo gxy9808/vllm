@@ -67,22 +67,16 @@ struct TiktokenModelConfig {
 }
 
 impl TiktokenModelConfig {
-    /// Read `model_type` from a model `config.json` value, falling back to a
-    /// single-level nested `text_config.model_type` for composite (e.g.
-    /// multimodal) configs that keep text metadata under a `text_config`
-    /// object.
+    /// Read `model_type` from the selected text config. A nested
+    /// `text_config`, when present, takes precedence over wrapper metadata.
     fn effective_model_type(&self) -> Option<&str> {
-        self.model_type
-            .as_deref()
-            .or_else(|| self.text_config.as_deref()?.effective_model_type())
+        self.text_config.as_deref().unwrap_or(self).model_type.as_deref()
     }
 
-    /// Read `vocab_size` from a model `config.json` value, falling back to a
-    /// single-level nested `text_config.vocab_size` for composite (e.g.
-    /// multimodal) configs that keep text metadata under a `text_config`
-    /// object — matching the same shape `ModelConfig` parses.
+    /// Read `vocab_size` from the selected text config, matching
+    /// `vllm_text::backend::hf::ModelConfig`.
     fn effective_vocab_size(&self) -> Option<u32> {
-        self.vocab_size.or_else(|| self.text_config.as_deref()?.effective_vocab_size())
+        self.text_config.as_deref().unwrap_or(self).vocab_size
     }
 }
 
@@ -800,7 +794,7 @@ mod tests {
         let bpe_path = write_synthetic_bpe_file(dir.path());
         fs::write(
             dir.path().join("config.json"),
-            r#"{"text_config": {"vocab_size": 270}}"#,
+            r#"{"vocab_size": 260, "text_config": {"vocab_size": 270}}"#,
         )
         .expect("write config.json");
 
@@ -833,14 +827,14 @@ mod tests {
         assert_eq!(detect_bpe_pattern(&kimi), KIMI_PATTERN);
         assert_eq!(detect_bpe_pattern(&kimi_k3), KIMI_PATTERN);
         assert_eq!(detect_bpe_pattern(&baseten_kimi), KIMI_PATTERN);
-        assert_eq!(detect_bpe_pattern(&nested_kimi), CL100K_BASE_PATTERN);
+        assert_eq!(detect_bpe_pattern(&nested_kimi), KIMI_PATTERN);
         assert_eq!(detect_bpe_pattern(&generic), CL100K_BASE_PATTERN);
         assert_eq!(detect_bpe_pattern(&nested_generic), CL100K_BASE_PATTERN);
         assert_eq!(detect_bpe_pattern(&missing), CL100K_BASE_PATTERN);
     }
 
     #[test]
-    fn tiktoken_reads_model_type_from_text_config_when_top_level_missing() {
+    fn tiktoken_prefers_model_type_from_text_config() {
         let nested_only = config_json!({
             "text_config": { "model_type": "kimi_k2" }
         });
@@ -853,7 +847,7 @@ mod tests {
         });
 
         assert_eq!(nested_only.effective_model_type(), Some("kimi_k2"));
-        assert_eq!(direct_and_nested.effective_model_type(), Some("kimi_k25"));
+        assert_eq!(direct_and_nested.effective_model_type(), Some("kimi_k2"));
         assert_eq!(missing.effective_model_type(), None);
     }
 

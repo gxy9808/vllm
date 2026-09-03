@@ -836,7 +836,7 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
             tracker.append_block_ids(new_block_ids)
 
         # Update the state of the tracker
-        condition = tracker.needs_retrieve()
+        condition = num_external_tokens > 0 and tracker.needs_retrieve()
         if tracker.state == LMCacheMPRequestState.PREFETCHING:
             # If need to retrieve, change to WAITING_FOR_LOAD
             # Otherwise, change to READY

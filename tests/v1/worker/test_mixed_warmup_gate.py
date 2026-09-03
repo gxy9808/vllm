@@ -5,8 +5,13 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
-from vllm.v1.worker.gpu.warmup import run_mixed_prefill_decode_warmup
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+from vllm.v1.worker.gpu.warmup import (
+    _reserved_block_count,
+    run_mixed_prefill_decode_warmup,
+)
 
 
 def _fail(*args, **kwargs):
@@ -27,4 +32,49 @@ def test_mixed_warmup_skipped_for_single_seq(max_num_reqs):
             num_tokens=128,
         )
         is False
+    )
+
+
+def test_reserved_block_count_includes_spec_lookahead():
+    spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+
+    assert (
+        _reserved_block_count(
+            16,
+            spec,
+            num_lookahead_tokens=3,
+            max_model_len=128,
+            max_encoder_len=0,
+        )
+        == 2
+    )
+
+
+@pytest.mark.parametrize(
+    ("cache_mode", "expected_blocks"),
+    [("none", 5), ("all", 5), ("align", 4)],
+)
+def test_reserved_block_count_matches_mamba_policy(cache_mode, expected_blocks):
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode=cache_mode,
+        num_speculative_blocks=3,
+    )
+
+    assert (
+        _reserved_block_count(
+            16,
+            spec,
+            num_lookahead_tokens=3,
+            max_model_len=128,
+            max_encoder_len=0,
+        )
+        == expected_blocks
     )

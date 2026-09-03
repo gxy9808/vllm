@@ -20,6 +20,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     SingleTypeKVCacheManager,
     SinkFullAttentionManager,
     SlidingWindowManager,
+    get_manager_for_kv_cache_spec,
     register_all_kvcache_specs,
 )
 from vllm.v1.kv_cache_interface import (
@@ -214,6 +215,66 @@ class TestKVCacheSpecRegistry:
             @dataclass(frozen=True, kw_only=True)
             class _CustomFullSpecWithoutManager(FullAttentionSpec):
                 custom_param: int = 16
+
+    def test_manager_factory_preserves_legacy_direct_call_shape(self, monkeypatch):
+        class LegacyManager:
+            def __init__(self, kv_cache_spec, marker):
+                self.kv_cache_spec = kv_cache_spec
+                self.marker = marker
+
+        monkeypatch.setattr(
+            KVCacheSpecRegistry,
+            "get_manager_class",
+            staticmethod(lambda _spec: LegacyManager),
+        )
+
+        manager = get_manager_for_kv_cache_spec(
+            make_spec(FullAttentionSpec),
+            max_in_flight_tokens=1,
+            max_model_len=128,
+            marker="legacy",
+        )
+
+        assert manager.marker == "legacy"
+        assert manager.kv_cache_spec == make_spec(FullAttentionSpec)
+
+    def test_manager_factory_preserves_legacy_swa_sizing_override(
+        self, monkeypatch
+    ):
+        @dataclass(frozen=True, kw_only=True)
+        class LegacySlidingSpec(SlidingWindowSpec):
+            def max_admission_blocks_per_request(
+                self, max_in_flight_tokens, max_model_len
+            ):
+                return 7
+
+        class LegacyManager:
+            def __init__(self, kv_cache_spec, **kwargs):
+                self.kv_cache_spec = kv_cache_spec
+                self.kwargs = kwargs
+
+        monkeypatch.setattr(
+            KVCacheSpecRegistry,
+            "get_manager_class",
+            staticmethod(lambda _spec: LegacyManager),
+        )
+
+        spec = LegacySlidingSpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+            sliding_window=128,
+        )
+        manager = get_manager_for_kv_cache_spec(
+            spec,
+            max_in_flight_tokens=1,
+            max_model_len=128,
+            scheduler_block_size=64,
+        )
+
+        assert manager.kwargs["max_admission_blocks_per_request"] == 7
+        assert manager.kwargs["scheduler_block_size"] == 64
 
     def test_unregistered_spec_no_registered_parent_raises(self):
         """

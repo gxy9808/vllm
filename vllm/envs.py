@@ -280,6 +280,26 @@ if TYPE_CHECKING:
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
+    # Step4 model and DSA backend controls.
+    VLLM_STEP_CC_LEVEL: int = 0
+    VLLM_STEP4_DSA_INDEX_TP_SIZE: int = 4
+    VLLM_STEP4_ENABLE_QKVG_PROJ: bool = False
+    VLLM_STEP4_FUSE_INDEXER_NORM: bool = True
+    VLLM_STEP4_O_PROJ_REDUCE_SCATTER: bool = False
+    # DSA top-k ties are common for repeated/quantized summary scores.  The
+    # streaming selector is not deterministic on SM90, so stable selection is
+    # the correctness-first default; users may opt out for benchmarking.
+    VLLM_STEP4_DSA_FORCE_STABLE_TOPK: bool = True
+    VLLM_STEP4_SPARSE: bool = False
+    VLLM_STEP4_SPARSE_ATTENTION_IMPL: str = "sparse_gqa"
+    VLLM_STEP4_SPARSE_DECODE_SPLIT_MAX: int = 16
+    VLLM_STEP4_SPARSE_INDEXER_ROPE_DIM: int = 32
+    VLLM_STEP4_SPARSE_PROXY_DIM: int = 256
+    VLLM_STEP4_SPARSE_REGION_BLOCK_SIZE: int = 8
+    VLLM_STEP4_SPARSE_TOPK: int = 512
+    VLLM_STEP4_JIT_CACHE_DIR: str | None = None
+    VLLM_DSA_OCC_EVERY: int = 0
+    VLLM_DSA_TSL_REDZONE: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
     VLLM_WSL2_ENABLE_PIN_MEMORY: bool = False
     VLLM_DISABLE_LOG_LOGO: bool = False
@@ -1930,6 +1950,55 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD": lambda: int(
         int(os.getenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", 256))
     ),
+    # Step4 Optimus custom-op tier.
+    "VLLM_STEP_CC_LEVEL": lambda: int(os.getenv("VLLM_STEP_CC_LEVEL", "0")),
+    "VLLM_STEP4_DSA_INDEX_TP_SIZE": lambda: int(
+        os.getenv("VLLM_STEP4_DSA_INDEX_TP_SIZE", "4")
+    ),
+    # If set, Step4 attention fuses Q/K/V and the per-head gate into one
+    # QKVG projection when the tensor-parallel layout supports it.
+    "VLLM_STEP4_ENABLE_QKVG_PROJ": lambda: (
+        os.getenv("VLLM_STEP4_ENABLE_QKVG_PROJ", "false").lower() in ("1", "true")
+    ),
+    "VLLM_STEP4_FUSE_INDEXER_NORM": lambda: (
+        os.getenv("VLLM_STEP4_FUSE_INDEXER_NORM", "true").lower() in ("1", "true")
+    ),
+    # If set, Step4 attention o_proj uses reduce-scatter instead of all-reduce
+    # when the layer is running in the MoE sequence-parallel path.
+    "VLLM_STEP4_O_PROJ_REDUCE_SCATTER": lambda: (
+        os.getenv("VLLM_STEP4_O_PROJ_REDUCE_SCATTER", "false").lower() in ("1", "true")
+    ),
+    # The Step4 DSA backend uses deterministic top-k selection by default.
+    # Set this to false only for performance experiments; unstable tie
+    # selection can change sparse attention outputs.
+    "VLLM_STEP4_DSA_FORCE_STABLE_TOPK": lambda: (
+        os.getenv("VLLM_STEP4_DSA_FORCE_STABLE_TOPK", "true").lower() in ("1", "true")
+    ),
+    "VLLM_STEP4_SPARSE": lambda: (
+        os.getenv("VLLM_STEP4_SPARSE", "false").lower() in ("1", "true")
+    ),
+    "VLLM_STEP4_SPARSE_ATTENTION_IMPL": lambda: os.getenv(
+        "VLLM_STEP4_SPARSE_ATTENTION_IMPL", "sparse_gqa"
+    ),
+    "VLLM_STEP4_SPARSE_DECODE_SPLIT_MAX": lambda: int(
+        os.getenv("VLLM_STEP4_SPARSE_DECODE_SPLIT_MAX", "16")
+    ),
+    "VLLM_STEP4_SPARSE_INDEXER_ROPE_DIM": lambda: int(
+        os.getenv("VLLM_STEP4_SPARSE_INDEXER_ROPE_DIM", "32")
+    ),
+    "VLLM_STEP4_SPARSE_PROXY_DIM": lambda: int(
+        os.getenv("VLLM_STEP4_SPARSE_PROXY_DIM", "256")
+    ),
+    "VLLM_STEP4_SPARSE_REGION_BLOCK_SIZE": lambda: int(
+        os.getenv("VLLM_STEP4_SPARSE_REGION_BLOCK_SIZE", "8")
+    ),
+    "VLLM_STEP4_SPARSE_TOPK": lambda: int(os.getenv("VLLM_STEP4_SPARSE_TOPK", "512")),
+    # Location for Step4 model-scoped JIT helper artifacts.
+    "VLLM_STEP4_JIT_CACHE_DIR": lambda: os.getenv("VLLM_STEP4_JIT_CACHE_DIR", None),
+    "VLLM_DSA_OCC_EVERY": lambda: int(os.getenv("VLLM_DSA_OCC_EVERY", "0")),
+    "VLLM_DSA_TSL_REDZONE": lambda: (
+        os.getenv("VLLM_DSA_TSL_REDZONE", "false").lower() in ("1", "true")
+    ),
     # Token-count cutoff for multi-stream overlap of the attention input
     # GEMM with auxiliary GEMMs (e.g. fused_wqa_wkv overlapped with indexer
     # weights / kv-score projections in DeepSeek-V4). At or below this many
@@ -2142,6 +2211,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DEBUG_DUMP_PATH",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",
+        "VLLM_STEP4_JIT_CACHE_DIR",
         # Runtime memory-plan persistence; does not affect compiled graphs.
         "VLLM_ENABLE_STARTUP_PLAN",
         # Location-only derived paths: where a cache/config directory lives

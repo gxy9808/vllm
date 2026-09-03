@@ -54,6 +54,7 @@ MTPModelTypes = Literal[
     "kimi_k3_mtp",
     "pangu_ultra_moe_mtp",
     "step3p5_mtp",
+    "step4_mtp",
     "hy_v3_mtp",
     "gemma4_mtp",
     "inkling_mtp",
@@ -555,6 +556,22 @@ class SpeculativeConfig:
             n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
             hf_config.update({"n_predict": n_predict, "architectures": ["Step3p5MTP"]})
 
+        # Step4 has its own draft module because its model and weight-loading
+        # contracts differ from Step3.5.
+        if hf_config.model_type == "step4" or "Step4ForCausalLM" in (
+            getattr(hf_config, "architectures", None) or []
+        ):
+            quantization_config = getattr(hf_config, "quantization_config", None)
+            hf_config = getattr(hf_config, "text_config", hf_config)
+            if (
+                quantization_config is not None
+                and getattr(hf_config, "quantization_config", None) is None
+            ):
+                hf_config.update({"quantization_config": quantization_config})
+            hf_config.model_type = "step4_mtp"
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
+            hf_config.update({"n_predict": n_predict, "architectures": ["Step4MTP"]})
+
         if initial_architecture == "MistralLarge3ForCausalLM":
             hf_config.update({"architectures": ["EagleMistralLarge3ForCausalLM"]})
 
@@ -839,6 +856,18 @@ class SpeculativeConfig:
                     draft_hf_overrides = SpeculativeConfig.compose_draft_hf_overrides(
                         self.target_model_config.hf_overrides
                     )
+                same_model_source = self.model == self.target_model_config.model
+                draft_revision = self.revision
+                draft_code_revision = self.code_revision
+                if same_model_source:
+                    # In-tree MTP/DSpark drafters reuse the target checkpoint.
+                    # Preserve an alternate config path and pinned revisions;
+                    # otherwise the draft silently reparses ``model`` and may
+                    # load a different (or remote-code-only) config.
+                    if draft_revision is None:
+                        draft_revision = self.target_model_config.revision
+                    if draft_code_revision is None:
+                        draft_code_revision = self.target_model_config.code_revision
                 self.draft_model_config = ModelConfig(
                     model=self.model,
                     runner="draft",
@@ -853,9 +882,18 @@ class SpeculativeConfig:
                     allowed_media_domains=self.target_model_config.allowed_media_domains,
                     dtype=self.target_model_config.dtype,
                     seed=self.target_model_config.seed,
-                    revision=self.revision,
-                    code_revision=self.code_revision,
-                    tokenizer_revision=self.target_model_config.tokenizer_revision,
+                    hf_config_path=(
+                        self.target_model_config.hf_config_path
+                        if same_model_source
+                        else None
+                    ),
+                    revision=draft_revision,
+                    code_revision=draft_code_revision,
+                    tokenizer_revision=(
+                        draft_revision
+                        if self.use_heterogeneous_vocab
+                        else self.target_model_config.tokenizer_revision
+                    ),
                     max_model_len=self.max_model_len,  # type: ignore[arg-type]
                     spec_target_max_model_len=self.target_model_config.max_model_len,
                     quantization=self.quantization,
@@ -907,7 +945,7 @@ class SpeculativeConfig:
                     if (
                         self.num_speculative_tokens > 1
                         and self.draft_model_config.hf_config.model_type
-                        not in ("step3p5_mtp", "inkling_mtp")
+                        not in ("step3p5_mtp", "step4_mtp", "inkling_mtp")
                     ):
                         logger.warning(
                             "Enabling num_speculative_tokens > 1 will run "
@@ -1343,15 +1381,28 @@ class SpeculativeConfig:
             and self.target_model_config is not None
             and self.draft_model_config is not None
         ):
-            target_vocab_size = self.target_model_config.get_vocab_size()
-            draft_vocab_size = self.draft_model_config.get_vocab_size()
+            if any(
+                model_config.requires_valid_vocab_size_resolution()
+                for model_config in (
+                    self.target_model_config,
+                    self.draft_model_config,
+                )
+            ):
+                # The effective vocabulary is resolved from the tokenizer after
+                # SpeculativeConfig validation. VllmConfig re-runs this check
+                # once both model configs have been resolved.
+                return
+            target_vocab_size = self.target_model_config.get_valid_vocab_size()
+            draft_vocab_size = self.draft_model_config.get_valid_vocab_size()
             if target_vocab_size != draft_vocab_size:
                 raise ValueError(
-                    f"Target and draft model should have the same vocabulary size. "
-                    f"Target model vocab_size={target_vocab_size}. "
+                    "Target and draft model should have the same effective "
+                    f"vocabulary size. Target model vocab_size={target_vocab_size}. "
                     f"Draft model vocab_size={draft_vocab_size}. "
-                    f"Using models with different tokenizers can cause out-of-bounds "
-                    f"errors during speculative decoding."
+                    "Using models with different tokenizers can cause out-of-bounds "
+                    "errors during speculative decoding. For greedy draft-model "
+                    "sampling, set use_heterogeneous_vocab=True to enable token "
+                    "mapping."
                 )
 
     @property
@@ -1384,6 +1435,14 @@ class SpeculativeConfig:
             and self.draft_model_config is not None
             and getattr(self.draft_model_config.hf_config, "model_type", None)
             == "step3p5_mtp"
+        )
+
+    def use_step_mtp(self) -> bool:
+        return (
+            self.method == "mtp"
+            and self.draft_model_config is not None
+            and getattr(self.draft_model_config.hf_config, "model_type", None)
+            in {"step3p5_mtp", "step4_mtp"}
         )
 
     def use_eagle(self) -> bool:

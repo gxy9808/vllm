@@ -8,6 +8,8 @@ import torch
 from vllm.platforms import current_platform
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
+    eagle_prepare_inputs_padded_kernel,
+    eagle_step_slot_mapping_metadata_kernel,
     eagle_step_update_slot_mapping_and_metadata,
 )
 
@@ -17,6 +19,11 @@ DEVICE_TYPE = current_platform.device_type
 pytest.importorskip("triton")
 if not current_platform.is_cuda_alike() and not current_platform.is_xpu():
     pytest.skip("CUDA/XPU required for EAGLE kernel tests", allow_module_level=True)
+
+
+def test_eagle_request_counts_are_runtime_values():
+    assert "batch_size" in eagle_step_slot_mapping_metadata_kernel.do_not_specialize
+    assert "num_reqs" in eagle_prepare_inputs_padded_kernel.do_not_specialize
 
 
 def _reference_eagle_step_slot_mapping(

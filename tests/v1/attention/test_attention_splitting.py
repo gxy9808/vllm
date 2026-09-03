@@ -460,3 +460,85 @@ def test_build_attention_metadata_zeros_stale_is_prefilling():
     assert not captured_is_prefilling[2]  # decode  (200 >= 200)
     assert not captured_is_prefilling[3]  # stale data (10 < 100) zeroed
     assert not captured_is_prefilling[4]  # stale data (20 < 200) zeroed
+
+
+def test_build_attention_metadata_does_not_cache_across_ubatches():
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    class Builder:
+        supports_update_block_table = True
+
+        def __init__(self, ubatch_id):
+            self.ubatch_id = ubatch_id
+            self.build_calls = 0
+            self.update_calls = 0
+
+        def build(self, common_prefix_len, common_attn_metadata):
+            self.build_calls += 1
+            return SimpleNamespace(ubatch_id=self.ubatch_id)
+
+        def update_block_table(self, metadata, block_table, slot_mapping):
+            self.update_calls += 1
+            return metadata
+
+    builders = [Builder(0), Builder(1)]
+    attn_group = SimpleNamespace(
+        layer_names=["layer"],
+        get_metadata_builder=lambda ubatch_id=0: builders[ubatch_id],
+    )
+    kv_cache_spec = object()
+    block_table = torch.zeros((2, 1), dtype=torch.int32)
+    input_batch = SimpleNamespace(
+        block_table={
+            0: SimpleNamespace(
+                get_device_tensor=lambda num_reqs: block_table[:num_reqs]
+            )
+        },
+        num_computed_tokens_cpu_tensor=torch.tensor([8, 16], dtype=torch.int32),
+        num_prompt_tokens_cpu_tensor=torch.tensor([8, 16], dtype=torch.int32),
+    )
+    query_start_loc = torch.tensor([0, 1, 2], dtype=torch.int32)
+    runner = SimpleNamespace(
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=kv_cache_spec)]
+        ),
+        attn_groups=[[attn_group]],
+        input_batch=input_batch,
+        query_start_loc=SimpleNamespace(
+            gpu=query_start_loc,
+            cpu=query_start_loc.clone(),
+        ),
+        seq_lens=torch.tensor([9, 17], dtype=torch.int32),
+        optimistic_seq_lens_cpu=torch.tensor([9, 17], dtype=torch.int32),
+        positions=torch.tensor([8, 16], dtype=torch.int64),
+        routed_experts_initialized=False,
+        use_async_spec_decode=False,
+        is_mm_prefix_lm=False,
+        model_config=SimpleNamespace(rswa_window=None),
+        cache_config=SimpleNamespace(
+            use_replayssm=False,
+            kv_sharing_fast_prefill=False,
+        ),
+        dcp_world_size=1,
+        speculative_config=None,
+        _get_encoder_seq_lens=lambda *args, **kwargs: (None, None),
+    )
+
+    metadata, _ = GPUModelRunner._build_attention_metadata(
+        runner,
+        num_tokens=2,
+        num_reqs=2,
+        max_query_len=1,
+        ubatch_slices=[
+            UBatchSlice(slice(0, 1), slice(0, 1)),
+            UBatchSlice(slice(1, 2), slice(1, 2)),
+        ],
+        slot_mappings={0: torch.tensor([0, 1], dtype=torch.int64)},
+    )
+
+    assert [builder.build_calls for builder in builders] == [1, 1]
+    assert [builder.update_calls for builder in builders] == [0, 0]
+    assert metadata[0]["layer"].ubatch_id == 0
+    assert metadata[1]["layer"].ubatch_id == 1

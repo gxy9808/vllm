@@ -69,6 +69,7 @@ def test_e2e_streaming_request_update_basic_flow(mock_model_runner_with_input_ba
         block_ids=([0],),
         num_computed_tokens=3,
         output_token_ids=[10, 11],  # Generated 2 tokens
+        prompt_is_token_ids=[True, True, True],
     )
     runner.requests[req_id] = initial_req_state
 
@@ -90,6 +91,7 @@ def test_e2e_streaming_request_update_basic_flow(mock_model_runner_with_input_ba
     ]  # Full sequence with intermediate output (10)
     new_req_data.mm_features = []
     new_req_data.prompt_embeds = None
+    new_req_data.prompt_is_token_ids = [True] * 6
     new_req_data.sampling_params = SamplingParams(temperature=0.8, max_tokens=50)
     new_req_data.pooling_params = None
     new_req_data.block_ids = ([0, 1],)
@@ -102,6 +104,7 @@ def test_e2e_streaming_request_update_basic_flow(mock_model_runner_with_input_ba
 
     # Step 4: Verify the request state was updated correctly
     assert updated_req_state.prompt_token_ids == [1, 2, 3, 10, 4, 5]
+    assert updated_req_state.prompt_is_token_ids == [True] * 6
     assert updated_req_state.num_computed_tokens == 4
     assert updated_req_state.sampling_params.temperature == 0.8
     assert updated_req_state.sampling_params.max_tokens == 50
@@ -170,6 +173,7 @@ def test_e2e_streaming_with_multimodal_features(mock_model_runner_with_input_bat
     new_req_data.prompt_token_ids = [1, 2] + [0] * 10 + [3, 4, 100] + [0] * 5 + [5]
     new_req_data.mm_features = [mm_feature_1, mm_feature_2]
     new_req_data.prompt_embeds = None
+    new_req_data.prompt_is_token_ids = None
     new_req_data.sampling_params = SamplingParams(temperature=0.7, max_tokens=30)
     new_req_data.pooling_params = None
     new_req_data.block_ids = ([0, 1],)

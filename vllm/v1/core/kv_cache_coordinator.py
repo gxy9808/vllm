@@ -75,6 +75,7 @@ class KVCacheCoordinator(ABC):
         scheduler_block_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        num_prefill_lookahead: int = 0,
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
@@ -86,6 +87,7 @@ class KVCacheCoordinator(ABC):
             for g in kv_cache_config.kv_cache_groups
         )
         self.scheduler_block_size = scheduler_block_size
+        self.num_reprefillable_tokens = max(0, num_prefill_lookahead - 1)
 
         self.block_pool = BlockPool(
             num_gpu_blocks=kv_cache_config.num_blocks,
@@ -102,6 +104,30 @@ class KVCacheCoordinator(ABC):
         # Conservatively fall back to flag all groups when no group is flagged.
         if use_eagle and not self.eagle_group_ids:
             self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
+        eagle_specs = [
+            kv_cache_config.kv_cache_groups[i].kv_cache_spec
+            for i in self.eagle_group_ids
+        ]
+        # Hybrid lookup batches equal specs together. If any member performs
+        # the EAGLE proof lookup, every manager in that spec group must retain
+        # the same proof tail.
+        self.eagle_proof_group_ids = {
+            i
+            for i, group in enumerate(kv_cache_config.kv_cache_groups)
+            if any(group.kv_cache_spec == spec for spec in eagle_specs)
+        }
+
+        if (
+            enable_caching
+            and self.eagle_group_ids
+            and scheduler_block_size < num_prefill_lookahead
+        ):
+            raise ValueError(
+                "Multi-module MTP with prefix caching requires "
+                "scheduler_block_size "
+                f"(={scheduler_block_size}) >= num_speculative_tokens "
+                f"(={num_prefill_lookahead})."
+            )
 
         self.single_type_managers = tuple(
             get_manager_for_kv_cache_spec(
@@ -115,6 +141,7 @@ class KVCacheCoordinator(ABC):
                 pcp_world_size=pcp_world_size,
                 scheduler_block_size=self.scheduler_block_size,
                 needs_kv_cache_zeroing=self.kv_cache_config.needs_kv_cache_zeroing,
+                retain_eagle_proof=(enable_caching and i in self.eagle_proof_group_ids),
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
@@ -281,9 +308,12 @@ class KVCacheCoordinator(ABC):
                 (including tokens that are already cached).
         """
         for manager in self.single_type_managers:
+            num_tokens_to_cache = max(
+                0, num_computed_tokens - self.num_reprefillable_tokens
+            )
             manager.cache_blocks(
                 request,
-                num_computed_tokens,
+                num_tokens_to_cache,
                 retention_interval=self.retention_interval,
             )
 
@@ -370,10 +400,18 @@ class KVCacheCoordinator(ABC):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        max_returned_cache_hit_length: int | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
         """Returns the per-group hit blocks, the hit length, and the number of
         ``num_uncached_common_prefix_tokens`` (a shared prefix that a
-        sparse-retention group has not cached yet; 0 unless hybrid)."""
+        sparse-retention group has not cached yet; 0 unless hybrid).
+
+        ``max_cache_hit_length`` is the lookup ceiling.  The optional
+        ``max_returned_cache_hit_length`` is a stricter ceiling for the
+        reconciled prefix returned to the scheduler.  EAGLE/MTP groups may
+        inspect one extra cache unit during lookup and then drop it, but the
+        returned hit must never exceed the latter ceiling.
+        """
         pass
 
     def new_step_starts(self) -> None:
@@ -402,6 +440,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         scheduler_block_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        num_prefill_lookahead: int = 0,
     ):
         super().__init__(
             kv_cache_config,
@@ -415,6 +454,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            num_prefill_lookahead=num_prefill_lookahead,
         )
         self.num_single_type_manager = len(self.single_type_managers)
 
@@ -425,6 +465,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        max_returned_cache_hit_length: int | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
         blocks: tuple[list[KVCacheBlock], ...] = tuple(
             [] for _ in range(self.num_single_type_manager)
@@ -452,6 +493,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         scheduler_block_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        num_prefill_lookahead: int = 0,
     ):
         super().__init__(
             kv_cache_config,
@@ -465,6 +507,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            num_prefill_lookahead=num_prefill_lookahead,
         )
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.block_size = self.kv_cache_spec.block_size
@@ -487,18 +530,38 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        max_returned_cache_hit_length: int | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
+        returned_ceiling = min(
+            max_cache_hit_length,
+            max_cache_hit_length
+            if max_returned_cache_hit_length is None
+            else max_returned_cache_hit_length,
+        )
+        drop_eagle_block = 0 in self.eagle_group_ids
+        lookup_ceiling = returned_ceiling
+        if drop_eagle_block:
+            # FullAttentionManager drops one block after lookup.  Give it that
+            # one-unit lookahead without allowing the returned hit to grow.
+            lookup_ceiling = min(
+                max_cache_hit_length,
+                returned_ceiling + self.block_size,
+            )
         hit_blocks, hit_length = self.single_type_managers[0].find_longest_cache_hit(
             block_hashes=block_hashes,
-            max_length=max_cache_hit_length,
+            max_length=lookup_ceiling,
             kv_cache_group_ids=[0],
             block_pool=self.block_pool,
             kv_cache_spec=self.kv_cache_spec,
-            drop_eagle_block=0 in self.eagle_group_ids,
+            drop_eagle_block=drop_eagle_block,
             alignment_tokens=self.block_size,
             dcp_world_size=self.dcp_world_size,
             pcp_world_size=self.pcp_world_size,
         )
+        if hit_length > returned_ceiling:
+            hit_length = returned_ceiling - returned_ceiling % self.block_size
+            for computed in hit_blocks:
+                del computed[cdiv(hit_length, self.block_size) :]
         # Single group: nothing "uncached common" -- no other group to lag it.
         return hit_blocks, hit_length, 0
 
@@ -537,6 +600,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         scheduler_block_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        num_prefill_lookahead: int = 0,
     ):
         super().__init__(
             kv_cache_config,
@@ -550,6 +614,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            num_prefill_lookahead=num_prefill_lookahead,
         )
         # hash_block_size: the block size used to compute block hashes.
         # The actual block size usually equals hash_block_size, but in cases where
@@ -668,9 +733,22 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             # EAGLE groups match one block past each aligned boundary and drop
             # it, so make that lookahead block eligible to be cached.
             if manager.use_eagle and aligned_num_computed_tokens > 0:
+                num_finalized_computed_tokens = max(
+                    0, num_computed_tokens - self.num_reprefillable_tokens
+                )
+                if self.enable_partial_hash_hits:
+                    aligned_num_finalized_computed_tokens = (
+                        num_finalized_computed_tokens
+                    )
+                else:
+                    aligned_num_finalized_computed_tokens = (
+                        num_finalized_computed_tokens
+                        // self.scheduler_block_size
+                        * self.scheduler_block_size
+                    )
                 num_tokens_to_cache = min(
-                    num_computed_tokens,
-                    aligned_num_computed_tokens + manager.block_size,
+                    num_finalized_computed_tokens,
+                    aligned_num_finalized_computed_tokens + manager.block_size,
                 )
             # The manager already knows the fine hit granularity
             # (``scheduler_block_size``); retention is passed separately so it
@@ -686,6 +764,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        max_returned_cache_hit_length: int | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
         """
         Find the longest cache hit using an iterative fixed-point algorithm.
@@ -708,7 +787,13 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         """
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
-        hit_length = max_cache_hit_length
+        returned_ceiling = min(
+            max_cache_hit_length,
+            max_cache_hit_length
+            if max_returned_cache_hit_length is None
+            else max_returned_cache_hit_length,
+        )
+        hit_length = returned_ceiling
         longest_hit_length = 0
         hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups
         hit_length_by_group: list[int] = [0] * num_groups
@@ -761,8 +846,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         else group_block_size
                     )
                     _max_length = min(
-                        curr_hit_length + eagle_margin, max_cache_hit_length
+                        curr_hit_length + eagle_margin,
+                        max_cache_hit_length,
                     )
+                else:
+                    _max_length = min(_max_length, returned_ceiling)
                 hit_blocks, _new_hit_length = manager_cls.find_longest_cache_hit(
                     block_hashes=block_hashes,
                     max_length=_max_length,
@@ -820,6 +908,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        max_returned_cache_hit_length: int | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], tuple[int, ...]]:
         """Like find_longest_cache_hit but evaluates each group independently.
 
@@ -828,13 +917,34 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         """
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
+        returned_ceiling = min(
+            max_cache_hit_length,
+            max_cache_hit_length
+            if max_returned_cache_hit_length is None
+            else max_returned_cache_hit_length,
+        )
         hit_blocks: list[list[KVCacheBlock]] = [[] for _ in range(num_groups)]
         hit_lengths: list[int] = [0] * num_groups
 
         for spec, group_ids, manager_cls, use_eagle in self.attention_groups:
+            first_group_id = group_ids[0]
+            group_block_size = self.single_type_managers[first_group_id].block_size
+            group_max_length = returned_ceiling
+            if use_eagle and not isinstance(spec, MambaSpec):
+                eagle_margin = (
+                    self.hash_block_size
+                    if self.enable_partial_hash_hits
+                    and manager_cls.supports_fine_grained_hash_lookup
+                    and group_block_size > self.hash_block_size
+                    else group_block_size
+                )
+                group_max_length = min(
+                    max_cache_hit_length,
+                    returned_ceiling + eagle_margin,
+                )
             blocks, group_hit = manager_cls.find_longest_cache_hit(
                 block_hashes=block_hashes,
-                max_length=max_cache_hit_length,
+                max_length=group_max_length,
                 kv_cache_group_ids=group_ids,
                 block_pool=self.block_pool,
                 kv_cache_spec=spec,
@@ -860,6 +970,7 @@ def get_kv_cache_coordinator(
     scheduler_block_size: int,
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
+    num_prefill_lookahead: int = 0,
 ) -> KVCacheCoordinator:
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
@@ -873,6 +984,7 @@ def get_kv_cache_coordinator(
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            num_prefill_lookahead=num_prefill_lookahead,
         )
     if len(kv_cache_config.kv_cache_groups) == 1:
         return UnitaryKVCacheCoordinator(
@@ -887,6 +999,7 @@ def get_kv_cache_coordinator(
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            num_prefill_lookahead=num_prefill_lookahead,
         )
     return HybridKVCacheCoordinator(
         kv_cache_config,
@@ -900,4 +1013,5 @@ def get_kv_cache_coordinator(
         scheduler_block_size=scheduler_block_size,
         hash_block_size=hash_block_size,
         metrics_collector=metrics_collector,
+        num_prefill_lookahead=num_prefill_lookahead,
     )

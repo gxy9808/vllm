@@ -559,6 +559,44 @@ class TestTakeEvents:
         assert mock_connector._kv_cache_events is None
 
 
+def test_mp_connector_zero_external_tokens_cancel_retrieve():
+    pytest.importorskip("lmcache")
+    from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_mp_connector import (
+        LMCacheMPConnectorMetadata,
+        LMCacheMPConnectorUpstream,
+        LMCacheMPRequestState,
+        LMCacheMPRequestTracker,
+    )
+
+    request = MagicMock(
+        request_id="request",
+        cache_salt=None,
+        all_token_ids=list(range(32)),
+        block_hashes=[],
+    )
+    tracker = LMCacheMPRequestTracker(request)
+    tracker.num_vllm_hit_blocks = 1
+    tracker.num_lmcache_hit_blocks = 2
+
+    connector = object.__new__(LMCacheMPConnectorUpstream)
+    connector.vllm_block_size = 16
+    connector.request_trackers = {request.request_id: tracker}
+    connector.scheduler_adapter = MagicMock()
+    blocks = MagicMock()
+    blocks.get_block_ids.return_value = ([1, 2],)
+
+    connector.update_state_after_alloc(request, blocks, num_external_tokens=0)
+
+    assert tracker.state == LMCacheMPRequestState.READY
+    metadata = LMCacheMPConnectorMetadata()
+    connector._process_retrieve_requests(metadata)
+    assert len(metadata) == 0
+    connector.scheduler_adapter.cleanup_lookup_result.assert_called_once_with(
+        request.request_id
+    )
+    connector.scheduler_adapter.free_lookup_locks.assert_called_once()
+
+
 class TestIntegrationScenarios:
     """Test integration scenarios."""
 

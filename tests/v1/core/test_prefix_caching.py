@@ -131,6 +131,234 @@ def make_kv_cache_config(block_size: int, num_blocks: int) -> KVCacheConfig:
     )
 
 
+def test_prefix_cache_recomputes_model_required_suffix():
+    block_size = 16
+    spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    ).with_side_storage(prefix_cache_recompute_tokens=64)
+    manager = make_kv_cache_manager(
+        KVCacheConfig(
+            num_blocks=64,
+            kv_cache_tensors=[],
+            kv_cache_groups=[KVCacheGroupSpec(["layer"], spec)],
+        ),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    token_ids = [i for i in range(8) for _ in range(block_size)]
+    producer = make_request("producer", token_ids, block_size, sha256)
+    producer_blocks, _, _ = manager.get_computed_blocks(producer)
+    assert manager.allocate_slots(
+        producer,
+        len(token_ids),
+        0,
+        producer_blocks,
+    )
+    manager.free(producer)
+
+    replay = make_request("replay", token_ids + [999], block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(replay)
+
+    assert num_computed_tokens == 4 * block_size
+    assert len(computed_blocks.blocks[0]) == 4
+
+
+def test_prefix_cache_recompute_contract_deduplicates_eagle_drop():
+    block_size = 16
+    spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    ).with_side_storage(prefix_cache_recompute_tokens=block_size)
+    manager = make_kv_cache_manager(
+        KVCacheConfig(
+            num_blocks=64,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["layer"], spec, is_eagle_group=True)
+            ],
+        ),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        use_eagle=True,
+    )
+    token_ids = [i for i in range(4) for _ in range(block_size)]
+    producer = make_request("producer", token_ids, block_size, sha256)
+    producer_blocks, _, _ = manager.get_computed_blocks(producer)
+    assert manager.allocate_slots(
+        producer,
+        len(token_ids),
+        0,
+        producer_blocks,
+    )
+    manager.free(producer)
+
+    replay = make_request("replay", token_ids + [999], block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(replay)
+
+    assert num_computed_tokens == 3 * block_size
+    assert len(computed_blocks.blocks[0]) == 3
+
+
+@pytest.mark.parametrize(
+    ("prompt_length", "use_eagle", "expected_hit"),
+    [
+        (4096, False, 4032),
+        (4097, False, 4032),
+        (4105, False, 4032),
+        (13391, False, 13312),
+        # At an exact block boundary, the ordinary logits lookup already
+        # excludes the final block before EAGLE/MTP applies its existing drop.
+        (4096, True, 3968),
+        (4097, True, 4032),
+        (4105, True, 4032),
+        (13391, True, 13312),
+    ],
+)
+def test_prefix_cache_recompute_step4_boundaries(
+    prompt_length: int,
+    use_eagle: bool,
+    expected_hit: int,
+):
+    block_size = 64
+    spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    ).with_side_storage(prefix_cache_recompute_tokens=block_size)
+    manager = make_kv_cache_manager(
+        KVCacheConfig(
+            num_blocks=512,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["layer"],
+                    spec,
+                    is_eagle_group=use_eagle,
+                )
+            ],
+        ),
+        max_model_len=16384,
+        enable_caching=True,
+        hash_block_size=block_size,
+        use_eagle=use_eagle,
+    )
+    token_ids = list(range(prompt_length))
+    producer = make_request("producer", token_ids, block_size, sha256)
+    producer_blocks, _, _ = manager.get_computed_blocks(producer)
+    assert manager.allocate_slots(
+        producer,
+        len(token_ids),
+        0,
+        producer_blocks,
+    )
+    manager.free(producer)
+
+    replay = make_request("replay", token_ids, block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(replay)
+
+    assert num_computed_tokens == expected_hit
+    assert len(computed_blocks.blocks[0]) == expected_hit // block_size
+
+
+def test_prefix_cache_recompute_contract_does_not_extend_an_earlier_miss():
+    block_size = 64
+    spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    ).with_side_storage(prefix_cache_recompute_tokens=block_size)
+    manager = make_kv_cache_manager(
+        KVCacheConfig(
+            num_blocks=128,
+            kv_cache_tensors=[],
+            kv_cache_groups=[KVCacheGroupSpec(["layer"], spec)],
+        ),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    replay_tokens = list(range(4097))
+    producer = make_request(
+        "producer",
+        replay_tokens[: 2 * block_size],
+        block_size,
+        sha256,
+    )
+    producer_blocks, _, _ = manager.get_computed_blocks(producer)
+    assert manager.allocate_slots(
+        producer,
+        len(producer.prompt_token_ids),
+        0,
+        producer_blocks,
+    )
+    manager.free(producer)
+
+    replay = make_request("replay", replay_tokens, block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(replay)
+
+    assert num_computed_tokens == 2 * block_size
+    assert len(computed_blocks.blocks[0]) == 2
+
+
+def test_prefix_cache_recompute_contract_keeps_hybrid_groups_aligned():
+    hash_block_size = 16
+    scheduler_block_size = 64
+    full_spec = FullAttentionSpec(
+        block_size=scheduler_block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float16,
+    ).with_side_storage(prefix_cache_recompute_tokens=scheduler_block_size)
+    swa_spec = SlidingWindowSpec(
+        block_size=hash_block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=scheduler_block_size,
+    )
+    manager = make_kv_cache_manager(
+        KVCacheConfig(
+            num_blocks=128,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["full"], full_spec),
+                KVCacheGroupSpec(["swa"], swa_spec),
+            ],
+        ),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+    token_ids = [
+        i for i in range(16) for _ in range(hash_block_size)
+    ]
+    producer = make_request("producer", token_ids, hash_block_size, sha256)
+    producer_blocks, _, _ = manager.get_computed_blocks(producer)
+    assert manager.allocate_slots(
+        producer,
+        len(token_ids),
+        0,
+        producer_blocks,
+    )
+    manager.free(producer)
+
+    replay = make_request("replay", token_ids + [999], hash_block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(replay)
+
+    assert num_computed_tokens == 3 * scheduler_block_size
+    assert len(computed_blocks.blocks[0]) == 3
+    assert len(computed_blocks.blocks[1]) == 12
+
+
 def make_kv_cache_config_hybrid_model(
     block_size: int,
     num_blocks: int,

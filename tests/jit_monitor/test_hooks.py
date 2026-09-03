@@ -297,24 +297,37 @@ def test_cutedsl_error_mode_raises():
 
 
 def test_cutedsl_subscripted_compile_is_monitored():
-    """``cute.compile[options](...)`` (flashinfer >= 0.6.14) must work."""
+    """Step4-style ``cute.compile[options](...)`` keeps options and is monitored."""
+
+    calls = []
 
     class FakeCompileCallable:
+        def __init__(self, options=None):
+            self.options = options
+
         def __getitem__(self, options):
-            return self
+            return FakeCompileCallable(options)
 
         def __call__(self, *args, **kwargs):
+            calls.append((self.options, args, kwargs))
             return "compiled"
 
+    def step4_kernel():
+        return None
+
+    options = ("opt_level", 3)
     with _patch_jit_modules(_make_fake_knobs(), cute_compile=FakeCompileCallable()):
         import cutlass.cute as cute
 
         jit_monitor.activate()
         with mock.patch.object(jit_monitor.logger, "warning_once") as warning_once:
-            result = cute.compile[("opt_level", 3)](lambda: None, "arg")
+            result = cute.compile[options](step4_kernel, "arg", dynamic=True)
 
     assert result == "compiled"
+    assert calls == [(options, (step4_kernel, "arg"), {"dynamic": True})]
     warning_once.assert_called_once()
+    msg = warning_once.call_args[0][0] % warning_once.call_args[0][1:]
+    assert "step4_kernel" in msg
 
 
 # ------------------------------------------------------------------

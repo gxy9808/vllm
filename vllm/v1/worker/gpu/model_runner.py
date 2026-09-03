@@ -119,7 +119,12 @@ from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
+from vllm.v1.worker.utils import (
+    KVBlockZeroer,
+    copy_kv_cache_blocks_inplace,
+    copy_kv_cache_side_storage_blocks,
+    reset_kv_cache_side_storage_runtime_state,
+)
 
 logger = init_logger(__name__)
 
@@ -150,7 +155,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # zeroing (e.g. hybrid models with fp8 KV cache).
         self.kv_block_zeroer: KVBlockZeroer | None = None
 
-        self.vocab_size = self.model_config.get_vocab_size()
+        self.vocab_size = self.model_config.get_valid_vocab_size()
         self.max_model_len = self.model_config.max_model_len
         self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
         self.max_num_reqs = self.scheduler_config.max_num_seqs
@@ -548,6 +553,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kernel_block_sizes=self.kernel_block_sizes,
             cache_dtype=self.cache_config.cache_dtype,
             static_forward_context=self.compilation_config.static_forward_context,
+            zero_base_kv_cache=self.kv_cache_config.needs_base_kv_cache_zeroing,
         )
 
     @torch.inference_mode()
@@ -735,6 +741,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def post_kv_cache_wake_up(self) -> None:
         self.block_tables.init_block_table_layout_tensors()
+        num_side_storages, num_scratch_buffers = (
+            reset_kv_cache_side_storage_runtime_state(
+                self.compilation_config.static_forward_context
+            )
+        )
+        if num_side_storages:
+            torch.accelerator.synchronize()
+            logger.info(
+                "Reset KV side-storage state after wake-up: "
+                "storages=%d scratch_buffers=%d",
+                num_side_storages,
+                num_scratch_buffers,
+            )
 
     def reset_mm_cache(self) -> None:
         if self.encoder_cache is not None:
@@ -782,6 +801,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             if self.speculator is not None:
                 self.speculator.capture()
+
+        torch.accelerator.synchronize()
+        num_side_storages, num_scratch_buffers = (
+            reset_kv_cache_side_storage_runtime_state(
+                self.compilation_config.static_forward_context
+            )
+        )
+        if num_side_storages:
+            logger.info(
+                "Reset KV side-storage state after graph capture: "
+                "storages=%d scratch_buffers=%d",
+                num_side_storages,
+                num_scratch_buffers,
+            )
+            torch.accelerator.synchronize()
 
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
@@ -916,17 +950,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
-        if scheduler_output.new_block_ids_to_zero:
+        if scheduler_output.new_block_ids_to_zero or any(
+            scheduler_output.new_block_ids_to_zero_by_group or ()
+        ):
             assert self.kv_block_zeroer is not None
-            self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
+            self.kv_block_zeroer.zero_block_ids(
+                scheduler_output.new_block_ids_to_zero or [],
+                scheduler_output.new_block_ids_to_zero_by_group,
+            )
 
         # Apply copy-on-write block copies for partial prefix-cache hits, after
         # zeroing new blocks and before the forward pass reads them.
-        if scheduler_output.kv_cache_block_copies:
+        if scheduler_output.kv_cache_block_copies or any(
+            scheduler_output.kv_cache_block_copies_by_group or ()
+        ):
             copy_kv_cache_blocks_inplace(
                 self.kv_caches,
                 self.kv_cache_config.num_blocks,
-                scheduler_output.kv_cache_block_copies,
+                scheduler_output.kv_cache_block_copies or [],
+            )
+            copy_kv_cache_side_storage_blocks(
+                self.compilation_config.static_forward_context,
+                self.kv_cache_config.kv_cache_groups,
+                scheduler_output.kv_cache_block_copies_by_group or (),
+                self.kv_cache_config.num_blocks,
             )
 
     def prepare_inputs(

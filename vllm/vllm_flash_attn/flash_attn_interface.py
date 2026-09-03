@@ -214,6 +214,7 @@ def flash_attn_varlen_func(
     aux_tensors=None,
     aux_tensor_leading_dims=None,
     dynamic_causal: "torch.Tensor | None" = None,
+    seqused_q=None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -310,6 +311,8 @@ def flash_attn_varlen_func(
             raise NotImplementedError("FA2 does not support s_aux")
         if num_splits > 1:
             raise NotImplementedError("FA2 does not support num_splits > 1")
+        if seqused_q is not None:
+            raise NotImplementedError("FA2 does not support seqused_q")
         if mask_mod is not None:
             raise NotImplementedError("FA2 does not support mask_mod")
         if aux_tensors is not None:
@@ -357,7 +360,7 @@ def flash_attn_varlen_func(
             cu_seqlens_q,
             cu_seqlens_k,  # cu_seqlens_k
             None,  # cu_seqlens_k_new
-            None,
+            seqused_q,
             seqused_k,  # seqused_q, seqused_k
             max_seqlen_q,
             max_seqlen_k,
@@ -387,6 +390,8 @@ def flash_attn_varlen_func(
         )
     elif fa_version == 4:
         assert alibi_slopes is None, "Alibi is not supported in FA4"
+        if seqused_q is not None:
+            raise NotImplementedError("FA4 does not support seqused_q")
         if block_sparse_tensors is not None:
             assert block_sparse_tensors.full_block_cnt is not None, (
                 "FA4 block_sparse_tensors must materialize empty full_block_cnt "

@@ -427,6 +427,16 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     "csrc/libtorch_stable/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu"
     "csrc/libtorch_stable/fused_kimi_k3_mla_key_concat_kv_cache_kernel.cu")
 
+  # Step4 native kernels use a dedicated stable-libtorch registration fragment.
+  # CUDA only: these kernels are hand-written for NVIDIA and are not
+  # HIP-portable.
+  if(VLLM_GPU_LANG STREQUAL "CUDA")
+    list(APPEND VLLM_STABLE_EXT_SRC
+      "csrc/libtorch_stable/step4/torch_bindings.cpp"
+      "csrc/libtorch_stable/step4/fused_add_rms_norm_kernel.cu"
+      "csrc/libtorch_stable/step4/fused_qknorm_rope_cache_kernel.cu")
+  endif()
+
   if(VLLM_GPU_LANG STREQUAL "CUDA" AND
      DEFINED CMAKE_CUDA_COMPILER_VERSION AND
      CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0)

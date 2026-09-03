@@ -16,6 +16,7 @@ from vllm.v1.core.kv_cache_utils import (
     resolve_block_hashes,
 )
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     ChunkedLocalAttentionSpec,
     CrossAttentionSpec,
     FullAttentionSpec,
@@ -83,11 +84,14 @@ class SingleTypeKVCacheManager(ABC):
         self._max_admission_blocks_per_request = max_admission_blocks_per_request
         # Record newly allocated block ids only when worker-side zeroing will
         # consume them and this manager holds a spec type that gets zeroed.
-        self._record_new_block_ids = needs_kv_cache_zeroing and type(kv_cache_spec) in (
-            FullAttentionSpec,
-            TQFullAttentionSpec,
-            MLAAttentionSpec,
-            HiddenStateCacheSpec,
+        # Every attention cache must be reset when the shared pool mixes
+        # precisions.  Sliding-window/chunked-local specs are AttentionSpec
+        # subclasses too; restricting this to FullAttentionSpec leaves their
+        # freshly recycled blocks uninitialized in mixed-precision hybrids.
+        # Side-storage-only groups still opt in through ``requires_zeroing``
+        # even when base KV zeroing is disabled.
+        self._record_new_block_ids = needs_kv_cache_zeroing and (
+            isinstance(kv_cache_spec, AttentionSpec) or kv_cache_spec.requires_zeroing
         )
         self.new_block_ids: list[int] = []
 
@@ -1080,7 +1084,11 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         Returns:
             The number of tokens that will be skipped for attention computation.
         """
-        return max(0, num_computed_tokens - self.sliding_window + 1)
+        retained_window = self.kv_cache_spec.retained_window_size(
+            scheduler_block_size=self.scheduler_block_size,
+            retain_eagle_proof=self.enable_caching and self.use_eagle,
+        )
+        return max(0, num_computed_tokens - retained_window + 1)
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """
@@ -1858,16 +1866,33 @@ def get_manager_for_kv_cache_spec(
     assert manager_class is not None, (
         f"No manager registered for KVCacheSpec {type(kv_cache_spec)}"
     )
+    scheduler_block_size = kwargs.get("scheduler_block_size")
+    retain_eagle_proof = kwargs.pop("retain_eagle_proof", False)
     # SlidingWindow / ChunkedLocalAttention managers recycle blocks;
     # the runtime admission cap must match the recycling-aware bound the
     # startup pool sizer uses (single source of truth: the spec method).
     # R-SWA also recycles gap blocks but peak physical KV still fits the
     # full-attention bound (prefix + window <= max_model_len), so it inherits
     # FullAttentionSpec sizing without a separate admission cap.
-    if isinstance(
-        kv_cache_spec,
-        (SlidingWindowSpec, ChunkedLocalAttentionSpec),
-    ):
+    if isinstance(kv_cache_spec, SlidingWindowSpec):
+        if retain_eagle_proof:
+            kwargs["max_admission_blocks_per_request"] = (
+                kv_cache_spec.max_admission_blocks_per_request(
+                    max_in_flight_tokens=max_in_flight_tokens,
+                    max_model_len=max_model_len,
+                    scheduler_block_size=scheduler_block_size,
+                    retain_eagle_proof=True,
+                )
+            )
+        else:
+            # Keep the legacy override shape for ordinary SWA callers.
+            kwargs["max_admission_blocks_per_request"] = (
+                kv_cache_spec.max_admission_blocks_per_request(
+                    max_in_flight_tokens=max_in_flight_tokens,
+                    max_model_len=max_model_len,
+                )
+            )
+    elif isinstance(kv_cache_spec, ChunkedLocalAttentionSpec):
         kwargs["max_admission_blocks_per_request"] = (
             kv_cache_spec.max_admission_blocks_per_request(
                 max_in_flight_tokens=max_in_flight_tokens,

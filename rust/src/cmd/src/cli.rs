@@ -121,6 +121,12 @@ pub struct SharedRuntimeArgs {
     /// public model ID.
     pub model: String,
 
+    /// Name or path of the Hugging Face tokenizer to use. If unspecified, the
+    /// model name or path is used.
+    #[arg(long)]
+    #[serde(default)]
+    pub tokenizer: Option<String>,
+
     /// Maximum time to wait for the expected engines to register on the
     /// frontend transport.
     #[arg(
@@ -154,6 +160,13 @@ pub struct SharedRuntimeArgs {
     #[arg(long, value_parser = clap::value_parser!(i32).range(-1..), allow_negative_numbers = true)]
     #[serde(default)]
     pub max_logprobs: Option<i32>,
+    /// Hard vocabulary boundary for models whose checkpoint vocabulary is padded.
+    #[arg(
+        long,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+    )]
+    #[serde(default)]
+    pub valid_vocab_size: Option<usize>,
     /// TCP port for the gRPC Generate service. When not set, no gRPC server is
     /// started.
     #[arg(long)]
@@ -415,6 +428,7 @@ impl SharedRuntimeArgs {
                 None => CoordinatorMode::None,
             },
             model: self.model,
+            tokenizer: self.tokenizer,
             served_model_name: self.served_model_name,
             listener_mode: HttpListenerMode::InheritedFd { fd: listen_fd },
             tool_call_parser: self.tool_call_parser,
@@ -426,6 +440,7 @@ impl SharedRuntimeArgs {
             limit_mm_per_prompt: self.limit_mm_per_prompt,
             chat_template_content_format: self.chat_template_content_format,
             max_logprobs: self.max_logprobs,
+            valid_vocab_size: self.valid_vocab_size,
             api_server_options,
             cors,
             tls,
@@ -468,6 +483,7 @@ impl SharedRuntimeArgs {
             },
             coordinator_mode: CoordinatorMode::MaybeInProc,
             model: self.model,
+            tokenizer: self.tokenizer,
             served_model_name: self.served_model_name,
             listener_mode,
             tool_call_parser: self.tool_call_parser,
@@ -479,6 +495,7 @@ impl SharedRuntimeArgs {
             limit_mm_per_prompt: self.limit_mm_per_prompt,
             chat_template_content_format: self.chat_template_content_format,
             max_logprobs: self.max_logprobs,
+            valid_vocab_size: self.valid_vocab_size,
             api_server_options,
             cors,
             tls,
@@ -685,7 +702,9 @@ impl ServeArgs {
 
         self.managed_engine.clone().into_config(
             self.runtime.model.clone(),
+            self.runtime.tokenizer.clone(),
             self.runtime.max_logprobs,
+            self.runtime.valid_vocab_size,
             profiler_config,
             reasoning_parser.as_deref(),
             self.runtime.language_model_only,

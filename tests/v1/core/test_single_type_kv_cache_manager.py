@@ -38,6 +38,78 @@ def get_sliding_window_manager(sliding_window_spec, block_pool, enable_caching=T
     )
 
 
+def test_side_storage_group_records_new_block_ids():
+    block_size = 2
+    spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=8,
+    ).with_side_storage(requires_zeroing=True)
+    block_pool = BlockPool(
+        num_gpu_blocks=8,
+        enable_caching=False,
+        hash_block_size=block_size,
+    )
+    manager = SlidingWindowManager(
+        spec,
+        block_pool=block_pool,
+        enable_caching=False,
+        kv_cache_group_id=0,
+        scheduler_block_size=block_size,
+        needs_kv_cache_zeroing=True,
+        max_admission_blocks_per_request=4,
+    )
+
+    new_blocks = manager.allocate_new_blocks(
+        "request",
+        num_tokens=block_size,
+        num_tokens_main_model=block_size,
+    )
+
+    assert manager.records_new_block_ids
+    assert manager.take_new_block_ids() == [block.block_id for block in new_blocks]
+
+
+def test_mixed_precision_sliding_window_group_records_new_block_ids():
+    """Mixed-precision pools must reset newly allocated SWA blocks too."""
+    block_size = 2
+    spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        # The manager receives ``needs_kv_cache_zeroing=True`` when this
+        # attention group participates in a mixed-precision pool.  The
+        # concrete dtype is irrelevant to the recording decision.
+        dtype=torch.bfloat16,
+        sliding_window=8,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=8,
+        enable_caching=False,
+        hash_block_size=block_size,
+    )
+    manager = SlidingWindowManager(
+        spec,
+        block_pool=block_pool,
+        enable_caching=False,
+        kv_cache_group_id=0,
+        scheduler_block_size=block_size,
+        needs_kv_cache_zeroing=True,
+        max_admission_blocks_per_request=4,
+    )
+
+    new_blocks = manager.allocate_new_blocks(
+        "request",
+        num_tokens=block_size,
+        num_tokens_main_model=block_size,
+    )
+
+    assert manager.records_new_block_ids
+    assert manager.take_new_block_ids() == [block.block_id for block in new_blocks]
+
+
 def get_chunked_local_attention_manager(
     chunked_local_attention_spec, block_pool, enable_caching=True
 ):

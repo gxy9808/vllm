@@ -1165,6 +1165,34 @@ def test_get_kv_cache_configs_multiple_workers():
 
 
 @pytest.mark.parametrize(
+    ("page_budget", "fixed_budget"),
+    [(128, 0), (0, 256)],
+)
+def test_get_kv_cache_configs_rejects_side_storage_mismatch(
+    default_vllm_config,
+    page_budget,
+    fixed_budget,
+):
+    vllm_config = default_vllm_config
+    regular_spec = new_kv_cache_spec()
+    side_storage_spec = regular_spec.with_side_storage(
+        requires_zeroing=True,
+        extra_budget_page_size_bytes=page_budget,
+        extra_budget_fixed_size_bytes=fixed_budget,
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match="different across workers",
+    ):
+        get_kv_cache_configs(
+            vllm_config,
+            [{"layer": regular_spec}, {"layer": side_storage_spec}],
+            [regular_spec.page_size_bytes * 10] * 2,
+        )
+
+
+@pytest.mark.parametrize(
     "asymmetric_memory",
     [False, True],
     ids=["symmetric", "asymmetric"],
@@ -1218,6 +1246,45 @@ def test_get_kv_cache_configs_pp_sharding(asymmetric_memory):
     ]
 
 
+def test_pp_projection_plans_only_local_side_storage():
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            max_model_len=256,
+            original_max_model_len=None,
+        ),
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(
+            disable_hybrid_kv_cache_manager=False,
+        ),
+        speculative_config=None,
+        kv_transfer_config=None,
+    )
+    spec = new_kv_cache_spec().with_side_storage(
+        extra_budget_page_size_bytes=256,
+        extra_budget_fixed_size_bytes=1024,
+    )
+    pool_stride = spec.page_size_bytes + spec.extra_budget_page_size_bytes
+    available_memory = spec.extra_budget_fixed_size_bytes + 33 * pool_stride
+
+    configs = get_kv_cache_configs(
+        vllm_config,
+        [{"stage0": spec}, {"stage1": spec}],
+        [available_memory, available_memory],
+    )
+
+    assert [config.num_blocks for config in configs] == [33, 33]
+    assert [config.kv_cache_groups[0].layer_names for config in configs] == [
+        ["stage0"],
+        ["stage1"],
+    ]
+    assert all(
+        kv_cache_utils._kv_cache_groups_fixed_budget_size(config.kv_cache_groups)
+        == spec.extra_budget_fixed_size_bytes
+        for config in configs
+    )
+
+
 def test_project_kv_cache_groups_to_worker():
     spec_a = new_kv_cache_spec()
     spec_b = new_kv_cache_spec(num_kv_heads=4)
@@ -1255,6 +1322,100 @@ def test_project_kv_cache_groups_to_worker():
     proj_spec = projected[0].kv_cache_spec
     assert isinstance(proj_spec, UniformTypeKVCacheSpecs)
     assert set(proj_spec.kv_cache_specs.keys()) == {"layer1", "layer3"}
+
+
+def test_empty_projected_group_keeps_blocks_but_not_side_storage_budget():
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=2048),
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        kv_transfer_config=None,
+        max_in_flight_tokens=128,
+    )
+    local_spec = new_kv_cache_spec()
+    remote_spec = new_sliding_window_spec(sliding_window=128).with_side_storage(
+        extra_budget_page_size_bytes=256,
+        extra_budget_fixed_size_bytes=1024,
+    )
+    global_groups = [
+        KVCacheGroupSpec(["local"], local_spec),
+        KVCacheGroupSpec(["remote"], remote_spec),
+    ]
+    required_blocks = sum(
+        kv_cache_utils._kv_cache_spec_required_blocks(
+            vllm_config,
+            group.kv_cache_spec,
+        )
+        for group in global_groups
+    )
+
+    local_groups = kv_cache_utils._project_kv_cache_groups_to_worker(
+        global_groups,
+        {"local": local_spec},
+    )
+    assert [group.layer_names for group in local_groups] == [["local"], []]
+    assert kv_cache_utils._kv_cache_groups_budget_page_size(local_groups) == (
+        local_spec.page_size_bytes
+    )
+    assert kv_cache_utils._kv_cache_groups_fixed_budget_size(local_groups) == 0
+    assert (
+        kv_cache_utils._max_memory_usage_bytes_from_groups(
+            vllm_config,
+            local_groups,
+        )
+        == required_blocks * local_spec.page_size_bytes
+    )
+
+    remote_groups = kv_cache_utils._project_kv_cache_groups_to_worker(
+        global_groups,
+        {"remote": remote_spec},
+    )
+    assert [group.layer_names for group in remote_groups] == [[], ["remote"]]
+    remote_block_stride = (
+        remote_spec.page_size_bytes + remote_spec.extra_budget_page_size_bytes
+    )
+    assert (
+        kv_cache_utils._kv_cache_groups_budget_page_size(remote_groups)
+        == remote_block_stride
+    )
+    assert (
+        kv_cache_utils._kv_cache_groups_fixed_budget_size(remote_groups)
+        == remote_spec.extra_budget_fixed_size_bytes
+    )
+    assert kv_cache_utils._max_memory_usage_bytes_from_groups(
+        vllm_config,
+        remote_groups,
+    ) == (
+        remote_spec.extra_budget_fixed_size_bytes
+        + required_blocks * remote_block_stride
+    )
+
+    target_concurrency = 3
+    local_config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        local_groups,
+        target_concurrency * required_blocks * local_spec.page_size_bytes,
+    )
+    remote_config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        remote_groups,
+        remote_spec.extra_budget_fixed_size_bytes
+        + target_concurrency * required_blocks * remote_block_stride,
+    )
+    assert (
+        get_max_concurrency_for_kv_cache_config(
+            vllm_config,
+            local_config,
+        )
+        == target_concurrency
+    )
+    assert (
+        get_max_concurrency_for_kv_cache_config(
+            vllm_config,
+            remote_config,
+        )
+        == target_concurrency
+    )
 
 
 def test_merge_kv_cache_spec():
@@ -1396,6 +1557,64 @@ def test_estimate_max_model_len(model_id, max_model_len, want_estimated_max_len)
     assert estimated_max_len == want_estimated_max_len
 
 
+def test_memory_helpers_use_group_aware_side_storage_budget():
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=256),
+        scheduler_config=SimpleNamespace(
+            disable_hybrid_kv_cache_manager=False,
+        ),
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        speculative_config=None,
+        kv_transfer_config=None,
+        max_in_flight_tokens=32,
+    )
+    full_spec = new_kv_cache_spec().with_side_storage(
+        extra_budget_page_size_bytes=new_kv_cache_spec().page_size_bytes,
+    )
+    sliding_spec = new_sliding_window_spec(sliding_window=64)
+    specs = {
+        "full": full_spec,
+        "sliding": sliding_spec,
+    }
+    groups = get_kv_cache_groups(vllm_config, specs.copy())
+    group_aware_needed = kv_cache_utils._max_memory_usage_bytes_from_groups(
+        vllm_config,
+        groups,
+    )
+    raw_spec_needed = kv_cache_utils.max_memory_usage_bytes(
+        vllm_config,
+        specs.values(),
+    )
+    available_memory = group_aware_needed - kv_cache_utils._pool_bytes_per_block(
+        vllm_config, groups
+    )
+
+    assert raw_spec_needed <= available_memory < group_aware_needed
+    with pytest.raises(ValueError, match="larger than the available"):
+        kv_cache_utils.check_enough_kv_cache_memory(
+            vllm_config,
+            specs,
+            available_memory,
+        )
+
+    estimated_max_model_len = estimate_max_model_len(
+        vllm_config,
+        specs,
+        available_memory,
+    )
+    assert (
+        estimated_max_model_len
+        == kv_cache_utils._estimate_max_model_len_from_groups(
+            vllm_config,
+            groups,
+            available_memory,
+        )
+    )
+    assert estimated_max_model_len < 256
+    assert vllm_config.model_config.max_model_len == 256
+
+
 def test_get_max_concurrency_for_kv_cache_config():
     # Create a VllmConfig
     model_id = "Qwen/Qwen1.5-7B"
@@ -1479,6 +1698,42 @@ def test_get_max_concurrency_for_kv_cache_config():
     )
     assert num_tokens == max_concurrency_hybrid_model * max_model_len
     assert max_concurrency == max_concurrency_hybrid_model
+
+    # Side buffers are allocated against the global block pool. Even block IDs
+    # used by the sliding-window group therefore consume every full-attention
+    # layer's side-buffer bytes.
+    side_budget = full_attention_spec.page_size_bytes
+    full_attention_with_side_storage = full_attention_spec.with_side_storage(
+        extra_budget_page_size_bytes=side_budget,
+    )
+    side_storage_groups = [
+        KVCacheGroupSpec(
+            [f"layer_{i}" for i in range(32)],
+            full_attention_with_side_storage,
+        ),
+        KVCacheGroupSpec(
+            [f"layer_{i}" for i in range(32, 64)],
+            sliding_window_spec,
+        ),
+    ]
+    kv_cache_config_with_side_storage = KVCacheConfig(
+        num_blocks=(1024 + 129) * 3,
+        kv_cache_tensors=[],
+        kv_cache_groups=side_storage_groups,
+    )
+    pool_bytes_per_block = 32 * full_attention_spec.page_size_bytes + 32 * side_budget
+    assert (
+        kv_cache_utils._max_memory_usage_bytes_from_groups(
+            vllm_config, side_storage_groups
+        )
+        == (1024 + 129) * pool_bytes_per_block
+    )
+    assert (
+        get_max_concurrency_for_kv_cache_config(
+            vllm_config, kv_cache_config_with_side_storage
+        )
+        == 3
+    )
 
     # Unequal group sizes in the standard layout: each group's pages cost
     # whole pool blocks, so a request needs 1024 + 129 = 1153 blocks — the
@@ -1601,6 +1856,119 @@ def test_get_max_concurrency_packed_kv_cache_config():
     assert get_max_concurrency_for_kv_cache_config(
         vllm_config, kv_cache_config_packed
     ) == num_blocks / (1024 + 73)
+
+
+def test_packed_layout_accounts_for_side_storage_and_fixed_budgets():
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=32),
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        kv_transfer_config=None,
+    )
+    first = new_kv_cache_spec().with_side_storage(
+        extra_budget_page_size_bytes=64,
+        extra_budget_fixed_size_bytes=1024,
+    )
+    second = new_kv_cache_spec().with_side_storage(
+        extra_budget_page_size_bytes=64,
+        extra_budget_fixed_size_bytes=1024,
+    )
+    third = new_kv_cache_spec(num_kv_heads=4).with_side_storage(
+        extra_budget_page_size_bytes=96,
+        extra_budget_fixed_size_bytes=2048,
+    )
+    groups = [
+        KVCacheGroupSpec(
+            ["first", "second"],
+            UniformTypeKVCacheSpecs(
+                block_size=16,
+                kv_cache_specs={"first": first, "second": second},
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["third"],
+            UniformTypeKVCacheSpecs(
+                block_size=16,
+                kv_cache_specs={"third": third},
+            ),
+        ),
+    ]
+    block_stride, _ = kv_cache_utils._get_packed_kv_cache_layout(groups)
+    side_stride = (
+        first.extra_budget_page_size_bytes
+        + second.extra_budget_page_size_bytes
+        + third.extra_budget_page_size_bytes
+    )
+    pool_stride = block_stride + side_stride
+    fixed_budget = (
+        first.extra_budget_fixed_size_bytes
+        + second.extra_budget_fixed_size_bytes
+        + third.extra_budget_fixed_size_bytes
+    )
+
+    assert kv_cache_utils._pool_bytes_per_block(vllm_config, groups) == pool_stride
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        groups,
+        fixed_budget + 7 * pool_stride,
+    )
+    assert config.num_blocks == 7
+
+    required_blocks = sum(
+        kv_cache_utils._kv_cache_spec_required_blocks(
+            vllm_config,
+            group.kv_cache_spec,
+        )
+        for group in groups
+    )
+    assert (
+        kv_cache_utils._max_memory_usage_bytes_from_groups(
+            vllm_config,
+            groups,
+        )
+        == fixed_budget + required_blocks * pool_stride
+    )
+
+
+def test_packed_memory_usage_with_fixed_only_side_budget_and_mixed_pages():
+    """Cross-layer packing must not fall back to the uniform-page formula."""
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=32),
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        kv_transfer_config=SimpleNamespace(
+            kv_connector_extra_config={"enable_cross_layers_blocks": "true"},
+        ),
+    )
+    first = new_kv_cache_spec().with_side_storage(
+        extra_budget_fixed_size_bytes=128,
+    )
+    second = new_kv_cache_spec(num_kv_heads=4).with_side_storage(
+        extra_budget_fixed_size_bytes=256,
+    )
+    groups = [
+        KVCacheGroupSpec(["first"], first),
+        KVCacheGroupSpec(["second"], second),
+    ]
+
+    assert kv_cache_utils._use_packed_kv_cache_config(vllm_config, groups)
+    pool_stride, _ = kv_cache_utils._get_packed_kv_cache_layout(groups)
+    required_blocks = sum(
+        kv_cache_utils._kv_cache_spec_required_blocks(
+            vllm_config,
+            group.kv_cache_spec,
+        )
+        for group in groups
+    )
+    fixed_budget = (
+        first.extra_budget_fixed_size_bytes + second.extra_budget_fixed_size_bytes
+    )
+
+    assert first.page_size_bytes != second.page_size_bytes
+    assert (
+        kv_cache_utils._max_memory_usage_bytes_from_groups(vllm_config, groups)
+        == fixed_budget + required_blocks * pool_stride
+    )
 
 
 def test_allocate_with_lookahead():
@@ -2069,6 +2437,210 @@ def test_generate_scheduler_kv_cache_config():
     )
 
 
+def test_generate_scheduler_kv_cache_config_preserves_replay_contract():
+    regular_spec = new_kv_cache_spec()
+    replay_spec = regular_spec.with_side_storage(prefix_cache_recompute_tokens=64)
+    uniform_spec = UniformTypeKVCacheSpecs(
+        block_size=regular_spec.block_size,
+        kv_cache_specs={
+            "layer_1": regular_spec,
+            "layer_2": replay_spec,
+        },
+    )
+    config = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["layer_1", "layer_2"], uniform_spec)],
+    )
+
+    scheduler_config = generate_scheduler_kv_cache_config([config])
+    scheduler_spec = scheduler_config.kv_cache_groups[0].kv_cache_spec
+    assert scheduler_spec.prefix_cache_recompute_tokens == 64
+
+
+def test_uniform_type_specs_reject_mixed_side_storage_contracts():
+    regular_spec = new_kv_cache_spec()
+    side_storage_spec = regular_spec.with_side_storage(
+        requires_zeroing=True,
+        extra_budget_page_size_bytes=128,
+        extra_budget_fixed_size_bytes=256,
+    )
+
+    specs = {
+        "regular": regular_spec,
+        "side_storage": side_storage_spec,
+    }
+    assert UniformTypeKVCacheSpecs.from_specs(specs) is None
+
+    groups = get_kv_cache_groups(_grouping_config(), specs)
+    assert len(groups) == 2
+    assert {
+        (
+            tuple(group.layer_names),
+            group.kv_cache_spec.extra_budget_page_size_bytes,
+            group.kv_cache_spec.extra_budget_fixed_size_bytes,
+            group.kv_cache_spec.requires_zeroing,
+        )
+        for group in groups
+    } == {
+        (("regular",), 0, 0, False),
+        (("side_storage",), 128, 256, True),
+    }
+
+
+@pytest.mark.parametrize("page_budget", [0, 128])
+def test_side_storage_fixed_budget_reduces_available_block_memory(
+    page_budget,
+):
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=32),
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        kv_transfer_config=None,
+    )
+    spec = new_kv_cache_spec().with_side_storage(
+        extra_budget_page_size_bytes=page_budget,
+        extra_budget_fixed_size_bytes=4096,
+    )
+    groups = [KVCacheGroupSpec(["layer_0", "layer_1"], spec)]
+    pool_bytes_per_block = 2 * (spec.page_size_bytes + page_budget)
+    fixed_budget = 2 * spec.extra_budget_fixed_size_bytes
+    available_memory = fixed_budget + 10 * pool_bytes_per_block
+
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        groups,
+        available_memory,
+    )
+
+    assert config.num_blocks == 10
+    required_blocks = kv_cache_utils._kv_cache_spec_required_blocks(
+        vllm_config,
+        spec,
+    )
+    assert (
+        kv_cache_utils._max_memory_usage_bytes_from_groups(
+            vllm_config,
+            groups,
+        )
+        == fixed_budget + required_blocks * pool_bytes_per_block
+    )
+
+
+def test_uniform_type_side_storage_budgets_are_aggregated_once():
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=32),
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        kv_transfer_config=None,
+    )
+    first = new_kv_cache_spec().with_side_storage(
+        extra_budget_page_size_bytes=64,
+        extra_budget_fixed_size_bytes=1024,
+    )
+    second = new_kv_cache_spec(num_kv_heads=2).with_side_storage(
+        extra_budget_page_size_bytes=96,
+        extra_budget_fixed_size_bytes=2048,
+    )
+    uniform_spec = UniformTypeKVCacheSpecs(
+        block_size=first.block_size,
+        kv_cache_specs={"first": first, "second": second},
+    )
+    groups = [KVCacheGroupSpec(["first", "second"], uniform_spec)]
+    pool_bytes_per_block = (
+        first.page_size_bytes
+        + first.extra_budget_page_size_bytes
+        + second.page_size_bytes
+        + second.extra_budget_page_size_bytes
+    )
+    fixed_budget = (
+        first.extra_budget_fixed_size_bytes + second.extra_budget_fixed_size_bytes
+    )
+
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        groups,
+        fixed_budget + 7 * pool_bytes_per_block,
+    )
+
+    assert uniform_spec.extra_budget_fixed_size_bytes == fixed_budget
+    assert config.num_blocks == 7
+    empty_group = KVCacheGroupSpec([], uniform_spec)
+    assert kv_cache_utils._kv_cache_group_extra_page_budget(empty_group) == 0
+    assert kv_cache_utils._kv_cache_groups_fixed_budget_size([empty_group]) == 0
+
+
+def test_side_storage_only_zeroing_preserves_group_ids_without_base_kv_writes():
+    side_spec = new_kv_cache_spec().with_side_storage(requires_zeroing=True)
+    config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["side"], side_spec)],
+    )
+    assert config.needs_kv_cache_zeroing
+    assert not config.needs_base_kv_cache_zeroing
+
+    class FakeManager:
+        kv_cache_spec = side_spec
+        records_new_block_ids = True
+
+        def take_new_block_ids(self):
+            return [3, 5]
+
+    manager = object.__new__(KVCacheManager)
+    manager.kv_cache_config = config
+    manager.coordinator = SimpleNamespace(single_type_managers=[FakeManager()])
+
+    base_ids, ids_by_group = manager.take_new_block_ids_for_zeroing()
+
+    assert base_ids == []
+    assert ids_by_group == [[3, 5]]
+
+
+def test_mixed_precision_zeroing_includes_sliding_window_attention_groups():
+    """All attention specs need base-page zeroing under mixed precision."""
+    full_spec = new_kv_cache_spec(dtype=torch.float16)
+    sliding_spec = SlidingWindowSpec(
+        block_size=full_spec.block_size,
+        num_kv_heads=full_spec.num_kv_heads,
+        head_size=full_spec.head_size,
+        dtype=torch.bfloat16,
+        sliding_window=128,
+    )
+    config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["full"], full_spec),
+            KVCacheGroupSpec(["sliding"], sliding_spec),
+        ],
+    )
+    assert config.needs_base_kv_cache_zeroing
+
+    class FakeManager:
+        def __init__(self, spec, block_ids):
+            self.kv_cache_spec = spec
+            self.records_new_block_ids = True
+            self._block_ids = block_ids
+
+        def take_new_block_ids(self):
+            return self._block_ids
+
+    manager = object.__new__(KVCacheManager)
+    manager.kv_cache_config = config
+    manager.coordinator = SimpleNamespace(
+        single_type_managers=[
+            FakeManager(full_spec, [1]),
+            FakeManager(sliding_spec, [2]),
+        ]
+    )
+
+    base_ids, ids_by_group = manager.take_new_block_ids_for_zeroing()
+
+    assert base_ids == [1, 2]
+    assert ids_by_group == [[1], [2]]
+
+
 def test_mixed_precision_kv_cache_with_uniform_type_specs():
     fp8_spec = new_kv_cache_spec(dtype=torch.float8_e4m3fn)
     bf16_spec = new_kv_cache_spec(dtype=torch.bfloat16)
@@ -2093,7 +2665,9 @@ def test_mixed_precision_kv_cache_with_uniform_type_specs():
     scheduler_config = generate_scheduler_kv_cache_config([worker_config])
 
     assert worker_config.needs_kv_cache_zeroing
+    assert worker_config.needs_base_kv_cache_zeroing
     assert scheduler_config.needs_kv_cache_zeroing
+    assert scheduler_config.needs_base_kv_cache_zeroing
 
 
 def new_mla_spec(cache_dtype_str=None, block_size=16):
@@ -2587,6 +3161,38 @@ def test_auto_fit_max_model_len_respects_num_gpu_blocks_override():
     assert 0 < vllm_config.model_config.max_model_len <= 32 * 16
 
 
+def test_auto_fit_and_override_include_side_storage_budgets():
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            max_model_len=1024,
+            original_max_model_len=-1,
+        ),
+        cache_config=SimpleNamespace(num_gpu_blocks_override=32),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(
+            disable_hybrid_kv_cache_manager=False,
+        ),
+        speculative_config=None,
+        kv_transfer_config=None,
+    )
+    spec = new_kv_cache_spec().with_side_storage(
+        extra_budget_page_size_bytes=256,
+        extra_budget_fixed_size_bytes=4096,
+    )
+    raw_available_memory = (
+        1024 * 2 * (spec.page_size_bytes + spec.extra_budget_page_size_bytes)
+    )
+
+    config = get_kv_cache_configs(
+        vllm_config,
+        [{"layer0": spec, "layer1": spec}],
+        [raw_available_memory],
+    )[0]
+
+    assert config.num_blocks == 32
+    assert vllm_config.model_config.max_model_len == 32 * spec.block_size
+
+
 def test_check_enough_kv_cache_memory_respects_num_gpu_blocks_override():
     """Admission check must use the override-clamped pool size, not raw
     `available_memory`. Without this, startup could accept a max_model_len
@@ -2607,6 +3213,36 @@ def test_check_enough_kv_cache_memory_respects_num_gpu_blocks_override():
 
     with pytest.raises(ValueError, match="max seq len"):
         get_kv_cache_configs(vllm_config, [kv_cache_specs], [large_available_memory])
+
+
+def test_num_gpu_blocks_override_preserves_fixed_side_storage_budget():
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            max_model_len=256,
+            original_max_model_len=None,
+        ),
+        cache_config=SimpleNamespace(num_gpu_blocks_override=16),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(
+            disable_hybrid_kv_cache_manager=False,
+        ),
+        speculative_config=None,
+        kv_transfer_config=None,
+    )
+    fixed_budget_per_layer = 1 << 20
+    spec = new_kv_cache_spec().with_side_storage(
+        extra_budget_fixed_size_bytes=fixed_budget_per_layer,
+    )
+    kv_cache_specs = {"layer_0": spec, "layer_1": spec}
+    raw_available_memory = 2 * fixed_budget_per_layer + 64 * 2 * spec.page_size_bytes
+
+    config = get_kv_cache_configs(
+        vllm_config,
+        [kv_cache_specs],
+        [raw_available_memory],
+    )[0]
+
+    assert config.num_blocks == 16
 
 
 def test_unify_kv_cache_page_size_uses_padding_for_non_divisible_sizes():
@@ -2647,6 +3283,60 @@ def test_unify_kv_cache_page_size_uses_padding_for_non_divisible_sizes():
     assert unified_draft_spec.real_page_size_bytes == draft_spec.real_page_size_bytes
     assert unified_draft_spec.page_size_padded == target_spec.page_size_bytes
     assert unified_draft_spec.page_size_bytes == target_spec.page_size_bytes
+
+
+def test_side_storage_contract_survives_resize_and_page_size_unification():
+    regular_spec = new_kv_cache_spec(indexes_kv_by_block_stride=True)
+    side_storage_spec = regular_spec.with_side_storage(
+        requires_zeroing=True,
+        extra_budget_page_size_bytes=4096,
+        extra_budget_fixed_size_bytes=8192,
+        prefix_cache_recompute_tokens=64,
+    )
+
+    # Side storage is planner metadata, not part of the main KV tensor layout
+    # identity used by existing dataclass equality and hash callers.
+    assert side_storage_spec == regular_spec
+    assert hash(side_storage_spec) == hash(regular_spec)
+
+    resized_spec = side_storage_spec.copy_with_new_block_size(8)
+    assert resized_spec.requires_zeroing
+    assert resized_spec.extra_budget_page_size_bytes == 4096
+    assert resized_spec.extra_budget_fixed_size_bytes == 8192
+    assert resized_spec.prefix_cache_recompute_tokens == 64
+
+    larger_spec = new_kv_cache_spec(num_kv_heads=4)
+    unified_specs = kv_cache_utils.unify_kv_cache_spec_page_size(
+        {
+            "side_storage": side_storage_spec,
+            "larger": larger_spec,
+        }
+    )
+    unified_side_storage_spec = unified_specs["side_storage"]
+    assert unified_side_storage_spec.block_size == side_storage_spec.block_size
+    assert unified_side_storage_spec.page_size_padded == larger_spec.page_size_bytes
+    assert unified_side_storage_spec.requires_zeroing
+    assert unified_side_storage_spec.extra_budget_page_size_bytes == 4096
+    assert unified_side_storage_spec.extra_budget_fixed_size_bytes == 8192
+    assert unified_side_storage_spec.prefix_cache_recompute_tokens == 64
+
+
+def test_side_storage_page_size_unification_requires_stride_padding():
+    side_storage_spec = new_kv_cache_spec().with_side_storage(
+        extra_budget_page_size_bytes=4096,
+    )
+    larger_spec = new_kv_cache_spec(num_kv_heads=4)
+
+    with pytest.raises(
+        NotImplementedError,
+        match="side-storage-backed block",
+    ):
+        kv_cache_utils.unify_kv_cache_spec_page_size(
+            {
+                "side_storage": side_storage_spec,
+                "larger": larger_spec,
+            }
+        )
 
 
 def test_unify_kv_cache_page_size_padding_requires_backend_support():

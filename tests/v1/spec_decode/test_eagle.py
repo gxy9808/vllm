@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -31,7 +32,9 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 model_dir = "meta-llama/Llama-3.1-8B-Instruct"
@@ -131,6 +134,7 @@ def test_prepare_next_token_ids():
     mock_input_batch.req_ids = req_ids
     mock_input_batch.num_reqs = num_requests
     mock_input_batch.vocab_size = 100
+    mock_input_batch.valid_vocab_size = 100
     mock_input_batch.num_tokens_no_spec = np.array(
         [num_speculative_tokens + 1] * num_requests
     )
@@ -193,6 +197,45 @@ def test_prepare_next_token_ids():
 
     assert torch.equal(next_token_ids_from_padded, expected_next_token_ids_tensor)
     assert torch.equal(valid_sampled_tokens_count, expected_valid_sampled_tokens_count)
+
+
+@pytest.mark.cpu_test
+def test_padded_next_tokens_use_dummy_backup_for_zero_token_row():
+    proposer = object.__new__(SpecDecodeBaseProposer)
+    proposer.backup_next_token_ids = CpuGpuBuffer(
+        2,
+        dtype=torch.int32,
+        device=torch.device("cpu"),
+        pin_memory=False,
+    )
+    live_request = SimpleNamespace(get_token_id=lambda position: position + 40)
+    load_only_request = SimpleNamespace(
+        get_token_id=lambda _position: pytest.fail(
+            "load-only rows must not read request tokens"
+        )
+    )
+    gpu_input_batch = SimpleNamespace(
+        num_reqs=2,
+        req_ids=["live", "load-only"],
+        num_tokens_no_spec=np.array([3, 0], dtype=np.int32),
+        valid_vocab_size=128,
+    )
+    proposer._launch_prepare_next_token_ids_padded = (
+        lambda _sampled, _discard, backup, _vocab_size: (
+            backup.clone(),
+            torch.zeros(2, dtype=torch.int32),
+        )
+    )
+
+    next_token_ids, valid_counts = proposer.prepare_next_token_ids_padded(
+        torch.zeros((2, 1), dtype=torch.int32),
+        {"live": live_request, "load-only": load_only_request},
+        gpu_input_batch,
+        torch.tensor([False, True]),
+    )
+
+    assert next_token_ids.tolist() == [42, 0]
+    assert valid_counts.tolist() == [0, 0]
 
 
 def test_prepare_inputs():

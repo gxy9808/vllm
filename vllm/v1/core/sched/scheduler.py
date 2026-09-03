@@ -244,7 +244,14 @@ class Scheduler(SchedulerInterface):
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
-        self.num_lookahead_tokens = 0
+        self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
+        # Positions past the computed tokens that the drafter reads mid-prefill.
+        # Eagle-family drafters read 1 ahead, but multi-module MTP reads
+        # num_spec_tokens ahead at chunked-prefill boundaries. Determines the
+        # encoder scheduling shift, the deferred encoder free, the KV cache
+        # manager's re-prefillable window (this minus 1), and how many tokens to
+        # reserve between a chunk boundary and the prefill end.
+        self.num_prefill_lookahead = 0
         self.dynamic_sd_lookup: list[int] | None = None
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
@@ -253,21 +260,13 @@ class Scheduler(SchedulerInterface):
                     vllm_max_batch_size=self.scheduler_config.max_num_seqs,
                     vllm_num_speculative_tokens=self.num_spec_tokens,
                 )
-            if speculative_config.use_eagle():
-                self.use_eagle = True
-                self.num_lookahead_tokens = self.num_spec_tokens
-            if speculative_config.uses_draft_model():
-                self.num_lookahead_tokens = self.num_spec_tokens
-            if speculative_config.use_dflash():
-                # DFlash requires an extra lookahead slot since it uses in-fill-style
-                # decoding instead of standard next-token sampling, so it has a query
-                # for the last sampled token plus queries for each draft token.
-                self.num_lookahead_tokens = self.num_spec_tokens + 1
-            if speculative_config.use_dspark():
-                # DSpark drafts a block of num_spec_tokens query tokens in which the
-                # anchor itself is the first prediction position (no separate bonus
-                # query), so it needs exactly num_spec_tokens lookahead slots.
-                self.num_lookahead_tokens = self.num_spec_tokens
+            self.use_eagle = speculative_config.use_eagle()
+            if self.use_eagle:
+                self.num_prefill_lookahead = (
+                    self.num_spec_tokens
+                    if speculative_config.use_multi_module_mtp()
+                    else 1
+                )
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -279,6 +278,7 @@ class Scheduler(SchedulerInterface):
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
             use_eagle=self.use_eagle,
+            num_prefill_lookahead=self.num_prefill_lookahead,
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
             dcp_world_size=self.dcp_world_size,
@@ -436,6 +436,27 @@ class Scheduler(SchedulerInterface):
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
 
+    def _reserve_prefill_lookahead(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+    ) -> int:
+        """Never end a prefill chunk within num_prefill_lookahead of the
+        prefill end.
+
+        At a chunked-prefill boundary, the multi-module MTP drafter consumes
+        the next num_prefill_lookahead known prefill tokens as draft inputs. A
+        boundary closer to the end than that would make it fall back to
+        sampled drafts, permanently polluting the trailing modules' KV caches.
+        Either finish the prefill or leave at least num_prefill_lookahead for
+        the next chunk. No-op for eagle-family drafters (lookahead 1).
+        """
+        remaining = request.num_tokens - num_computed_tokens - num_new_tokens
+        if 0 < remaining < self.num_prefill_lookahead:
+            num_new_tokens -= self.num_prefill_lookahead - remaining
+        return max(num_new_tokens, 0)
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -531,6 +552,12 @@ class Scheduler(SchedulerInterface):
                 - self.num_sampled_tokens_per_step,
             )
 
+            # Apply Mamba alignment before encoder caps.
+            if self.need_mamba_block_aligned_split:
+                num_new_tokens = self._mamba_block_aligned_split(
+                    request, num_new_tokens
+                )
+
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
             external_load_encoder_input: list[int] = []
@@ -546,13 +573,12 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens,
                     num_new_tokens,
                     encoder_compute_budget,
-                    shift_computed_tokens=1 if self.use_eagle else 0,
+                    shift_computed_tokens=self.num_prefill_lookahead,
                 )
 
-            if self.need_mamba_block_aligned_split:
-                num_new_tokens = self._mamba_block_aligned_split(
-                    request, num_new_tokens
-                )
+            num_new_tokens = self._reserve_prefill_lookahead(
+                request, request.num_computed_tokens, num_new_tokens
+            )
 
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
@@ -566,6 +592,8 @@ class Scheduler(SchedulerInterface):
                 # 3. The encoder cache is exhausted.
                 # 4. Insufficient budget for a block-aligned chunk in hybrid
                 #    models with mamba cache mode \"align\".
+                # 5. Insufficient budget to keep a multi-module MTP prefill
+                #    chunk out of the prefill-lookahead window.
                 # NOTE(woosuk): Here, by doing `continue` instead of `break`,
                 # we do not strictly follow the FCFS scheduling policy and
                 # allow the lower-priority requests to be scheduled.
@@ -788,6 +816,31 @@ class Scheduler(SchedulerInterface):
                             step_skipped_waiting.prepend_request(request)
                             continue
 
+                        # A model-specific prefix-replay contract applies to
+                        # both local and connector-backed hits.  If the remote
+                        # connector would fill past that boundary, decline the
+                        # remote suffix and recompute it locally instead of
+                        # silently undoing the local replay ceiling.
+                        max_returned_cache_hit_length = (
+                            self.kv_cache_manager.get_max_returned_cache_hit_length(
+                                request
+                            )
+                        )
+                        if (
+                            self.kv_cache_manager.prefix_cache_recompute_tokens > 0
+                            and block_aligned_local + ext_tokens
+                            > max_returned_cache_hit_length
+                        ):
+                            logger.debug(
+                                "Clamping connector prefix hit for %s from %d "
+                                "tokens to local replay boundary %d",
+                                request.request_id,
+                                ext_tokens,
+                                max_returned_cache_hit_length,
+                            )
+                            ext_tokens = 0
+                            load_kv_async = False
+
                         if partial_tail and ext_tokens > partial_tail:
                             # Remote strictly exceeds the full local hit: drop the
                             # sub-block tail so no CoW is needed, and let the load
@@ -913,6 +966,17 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
 
+                    # Apply Mamba alignment before encoder caps.
+                    if self.need_mamba_block_aligned_split:
+                        num_new_tokens = self._mamba_block_aligned_split(
+                            request,
+                            num_new_tokens,
+                            num_new_local_computed_tokens,
+                            num_external_computed_tokens,
+                        )
+                        if num_new_tokens == 0:
+                            break
+
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
                         (
@@ -925,21 +989,16 @@ class Scheduler(SchedulerInterface):
                             num_computed_tokens,
                             num_new_tokens,
                             encoder_compute_budget,
-                            shift_computed_tokens=1 if self.use_eagle else 0,
+                            shift_computed_tokens=self.num_prefill_lookahead,
                         )
-                        if num_new_tokens == 0:
-                            # The request cannot be scheduled.
-                            break
 
-                # Skip block alignment when setting up async receive (no local work).
-                if self.need_mamba_block_aligned_split and not load_kv_async:
-                    num_new_tokens = self._mamba_block_aligned_split(
-                        request,
-                        num_new_tokens,
-                        num_new_local_computed_tokens,
-                        num_external_computed_tokens,
+                    # Multi-module MTP: avoid ending a prefill chunk within
+                    # num_prefill_lookahead of the prefill end.
+                    num_new_tokens = self._reserve_prefill_lookahead(
+                        request, num_computed_tokens, num_new_tokens
                     )
                     if num_new_tokens == 0:
+                        # The request cannot be scheduled.
                         break
 
                 # During async KV load, no forward pass is run yet.
@@ -1178,9 +1237,11 @@ class Scheduler(SchedulerInterface):
                 self.kv_cache_manager.take_partial_tail_offloads() or None
             )
 
-        kv_cache_block_copies, cow_retained_blocks = (
-            self.kv_cache_manager.take_kv_cache_block_copies()
-        )
+        (
+            kv_cache_block_copies,
+            kv_cache_block_copies_by_group,
+            cow_retained_blocks,
+        ) = self.kv_cache_manager.take_kv_cache_block_copies_by_group()
         if kv_cache_block_copies:
             # The copies run with this step's execution; the first non-empty
             # step at or after it gets seq `sched_step_seq + 1` (0-token steps
@@ -1188,6 +1249,11 @@ class Scheduler(SchedulerInterface):
             # have run.
             self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)
         pending_kv_cache_block_copies = kv_cache_block_copies or None
+        pending_kv_cache_block_copies_by_group = (
+            kv_cache_block_copies_by_group
+            if any(kv_cache_block_copies_by_group)
+            else None
+        )
 
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.num_spec_tokens
@@ -1205,6 +1271,11 @@ class Scheduler(SchedulerInterface):
                 scheduled_encoder_inputs
             )
 
+        (
+            new_block_ids_to_zero,
+            new_block_ids_to_zero_by_group,
+        ) = self._get_new_block_ids_for_zeroing()
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1221,8 +1292,10 @@ class Scheduler(SchedulerInterface):
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
-            new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
+            new_block_ids_to_zero=new_block_ids_to_zero,
+            new_block_ids_to_zero_by_group=new_block_ids_to_zero_by_group,
             kv_cache_block_copies=pending_kv_cache_block_copies,
+            kv_cache_block_copies_by_group=(pending_kv_cache_block_copies_by_group),
             partial_tail_offloads=pending_partial_tail_offloads,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
@@ -1257,19 +1330,50 @@ class Scheduler(SchedulerInterface):
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
 
-    def _get_new_block_ids_to_zero(self) -> list[int] | None:
+    def _get_new_block_ids_for_zeroing(
+        self,
+    ) -> tuple[list[int] | None, list[list[int]] | None]:
         # Drain new attention block ids every step so the manager-side list
         # does not grow unbounded; only kv-cache zeroing consumes them.
-        new_block_ids_to_zero = self.kv_cache_manager.take_new_block_ids()
+        take_grouped_ids = getattr(
+            self.kv_cache_manager,
+            "take_new_block_ids_for_zeroing",
+            None,
+        )
+        if take_grouped_ids is None:
+            new_block_ids_to_zero = self.kv_cache_manager.take_new_block_ids()
+            new_block_ids_to_zero_by_group = None
+        else:
+            (
+                new_block_ids_to_zero,
+                new_block_ids_to_zero_by_group,
+            ) = take_grouped_ids()
         if not self.needs_kv_cache_zeroing:
-            return None
+            return None, None
 
         if self._skip_zero_block_ids:
             skip = self._skip_zero_block_ids
             new_block_ids_to_zero = [b for b in new_block_ids_to_zero if b not in skip]
+            if new_block_ids_to_zero_by_group is not None:
+                new_block_ids_to_zero_by_group = [
+                    [block_id for block_id in group_ids if block_id not in skip]
+                    for group_ids in new_block_ids_to_zero_by_group
+                ]
             skip.clear()
 
-        return new_block_ids_to_zero or None
+        # Keep the per-group container even when every group is empty.  A
+        # KVBlockZeroer may own side-storage hooks for groups that did not
+        # allocate a block in this step while another full-attention group did.
+        # Collapsing the empty list to ``None`` makes the zeroer reject the
+        # otherwise valid base-KV reset because it cannot map side-storage
+        # owners to group IDs.
+        grouped_ids = new_block_ids_to_zero_by_group
+        return new_block_ids_to_zero or None, grouped_ids
+
+    def _get_new_block_ids_to_zero(self) -> list[int] | None:
+        """Compatibility wrapper for callers that only consume base KV IDs."""
+        block_ids, _ = self._get_new_block_ids_for_zeroing()
+        return block_ids
 
     def _preempt_request(
         self, request: Request, timestamp: float, drop_stale_output: bool = False
@@ -1508,10 +1612,13 @@ class Scheduler(SchedulerInterface):
         mm_hashes_to_schedule = set()
         num_embeds_to_schedule = 0
 
+        encoder_window_end = (
+            num_computed_tokens + num_new_tokens + shift_computed_tokens
+        )
         lo, hi = get_mm_features_in_window(
             mm_features,
             start=num_computed_tokens,
-            end=num_computed_tokens + num_new_tokens + shift_computed_tokens,
+            end=encoder_window_end,
         )
         # For encoder-decoder, all inputs sit at start_pos=0, so lo=0 always.
         if self.is_encoder_decoder:
@@ -1593,9 +1700,7 @@ class Scheduler(SchedulerInterface):
             # Calculate the number of embeddings to schedule in the current range
             # of scheduled encoder placeholder tokens.
             start_idx_rel = max(0, num_computed_tokens - start_pos)
-            end_idx_rel = min(
-                num_encoder_tokens, num_computed_tokens + num_new_tokens - start_pos
-            )
+            end_idx_rel = min(num_encoder_tokens, encoder_window_end - start_pos)
             curr_embeds_start, curr_embeds_end = (
                 mm_feature.mm_position.get_embeds_indices_in_range(
                     start_idx_rel, end_idx_rel
@@ -2119,9 +2224,9 @@ class Scheduler(SchedulerInterface):
             return
 
         # Defer the free by the drafter's look-ahead so an entry stays
-        # referenced until the drafter's +1 read has also passed it, mirroring
-        # the shift the encoder scheduling path applies.
-        spec_lookahead = 1 if self.use_eagle else 0
+        # referenced until the drafter's read-ahead has also passed it,
+        # mirroring the shift the encoder scheduling path applies.
+        spec_lookahead = self.num_prefill_lookahead
 
         # Here, we use list(set) to avoid modifying the set while iterating
         # over it.

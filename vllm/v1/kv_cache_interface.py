@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import copy
 from collections import Counter
-from dataclasses import dataclass, fields, replace
+from collections.abc import Sequence
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum, IntEnum
 from math import prod
 from typing import TYPE_CHECKING
@@ -105,6 +106,36 @@ class KVCacheSpecKind(str, Enum):
 
 
 @dataclass(frozen=True)
+class KVCacheSideStorageSpec:
+    """Auxiliary storage and resume requirements for one KV cache spec."""
+
+    requires_zeroing: bool = False
+    extra_budget_page_size_bytes: int = 0
+    extra_budget_fixed_size_bytes: int = 0
+    prefix_cache_recompute_tokens: int = 0
+
+    def __post_init__(self) -> None:
+        page_budget = int(self.extra_budget_page_size_bytes or 0)
+        fixed_budget = int(self.extra_budget_fixed_size_bytes or 0)
+        recompute_tokens = int(self.prefix_cache_recompute_tokens or 0)
+        for name, budget in (
+            ("extra_budget_page_size_bytes", page_budget),
+            ("extra_budget_fixed_size_bytes", fixed_budget),
+            ("prefix_cache_recompute_tokens", recompute_tokens),
+        ):
+            if budget < 0:
+                raise ValueError(f"KV cache {name} must be non-negative, got {budget}")
+        object.__setattr__(self, "requires_zeroing", bool(self.requires_zeroing))
+        object.__setattr__(self, "extra_budget_page_size_bytes", page_budget)
+        object.__setattr__(self, "extra_budget_fixed_size_bytes", fixed_budget)
+        object.__setattr__(
+            self,
+            "prefix_cache_recompute_tokens",
+            recompute_tokens,
+        )
+
+
+@dataclass(frozen=True)
 class KVCacheSpec:
     """
     A base class for specifying the KV cache format of one layer.
@@ -112,6 +143,100 @@ class KVCacheSpec:
 
     # number of tokens in a block
     block_size: int
+
+    # This is planner metadata rather than part of the main KV tensor layout.
+    # Keep it keyword-only and out of equality/hash so existing spec identity,
+    # positional constructors, and grouping behavior remain compatible.
+    side_storage_spec: KVCacheSideStorageSpec = field(
+        default=KVCacheSideStorageSpec(),
+        kw_only=True,
+        compare=False,
+        repr=False,
+    )
+
+    @property
+    def requires_zeroing(self) -> bool:
+        """Whether newly allocated physical blocks must be cleared."""
+        return self.side_storage_spec.requires_zeroing
+
+    @property
+    def extra_budget_page_size_bytes(self) -> int:
+        """Additional per-block bytes reserved for layer-local side storage."""
+        return self.side_storage_spec.extra_budget_page_size_bytes
+
+    @property
+    def extra_budget_fixed_size_bytes(self) -> int:
+        """Fixed bytes reserved for layer-local side storage."""
+        return self.side_storage_spec.extra_budget_fixed_size_bytes
+
+    @property
+    def prefix_cache_recompute_tokens(self) -> int:
+        """Minimum prompt suffix to recompute after a local prefix-cache hit."""
+        return self.side_storage_spec.prefix_cache_recompute_tokens
+
+    def with_side_storage(
+        self,
+        *,
+        requires_zeroing: bool | None = None,
+        extra_budget_page_size_bytes: int | None = None,
+        extra_budget_fixed_size_bytes: int | None = None,
+        prefix_cache_recompute_tokens: int | None = None,
+    ) -> Self:
+        """Return a copy with an updated side-storage contract."""
+        current = self.side_storage_spec
+        return self.with_side_storage_spec(
+            KVCacheSideStorageSpec(
+                requires_zeroing=(
+                    current.requires_zeroing
+                    if requires_zeroing is None
+                    else requires_zeroing
+                ),
+                extra_budget_page_size_bytes=(
+                    current.extra_budget_page_size_bytes
+                    if extra_budget_page_size_bytes is None
+                    else extra_budget_page_size_bytes
+                ),
+                extra_budget_fixed_size_bytes=(
+                    current.extra_budget_fixed_size_bytes
+                    if extra_budget_fixed_size_bytes is None
+                    else extra_budget_fixed_size_bytes
+                ),
+                prefix_cache_recompute_tokens=(
+                    current.prefix_cache_recompute_tokens
+                    if prefix_cache_recompute_tokens is None
+                    else prefix_cache_recompute_tokens
+                ),
+            ),
+        )
+
+    def with_side_storage_spec(self, side_storage_spec: KVCacheSideStorageSpec) -> Self:
+        """Return a copy carrying the provided side-storage contract."""
+        return replace(self, side_storage_spec=side_storage_spec)
+
+    @classmethod
+    def merge_side_storage_specs(
+        cls, specs: Sequence[KVCacheSpec]
+    ) -> KVCacheSideStorageSpec:
+        """Merge the side-storage contract for one KV cache group."""
+        assert specs, "Cannot merge an empty list of KV cache specs."
+        extra_budgets = {spec.extra_budget_page_size_bytes for spec in specs}
+        assert len(extra_budgets) == 1, (
+            "All layers in the same KV cache group must have the same "
+            "extra per-page KV budget size."
+        )
+        fixed_budgets = {spec.extra_budget_fixed_size_bytes for spec in specs}
+        assert len(fixed_budgets) == 1, (
+            "All layers in the same KV cache group must have the same "
+            "extra fixed KV budget size."
+        )
+        return KVCacheSideStorageSpec(
+            requires_zeroing=any(spec.requires_zeroing for spec in specs),
+            extra_budget_page_size_bytes=extra_budgets.pop(),
+            extra_budget_fixed_size_bytes=fixed_budgets.pop(),
+            prefix_cache_recompute_tokens=max(
+                spec.prefix_cache_recompute_tokens for spec in specs
+            ),
+        )
 
     @property
     def page_size_bytes(self) -> int:
@@ -162,7 +287,11 @@ class KVCacheSpec:
         assert all(spec == specs[0] for spec in specs[1:]), (
             "All layers in the same KV cache group must be the same."
         )
-        return copy.deepcopy(specs[0])
+        merged_spec = copy.deepcopy(specs[0])
+        return replace(
+            merged_spec,
+            side_storage_spec=cls.merge_side_storage_specs(specs),
+        )
 
     def is_uniform_with_collection(
         self, kv_cache_specs: dict[str, KVCacheSpec]
@@ -305,6 +434,7 @@ class FullAttentionSpec(AttentionSpec):
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
+            side_storage_spec=cls.merge_side_storage_specs(specs),
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             head_size_v=specs[0].head_size_v,
@@ -320,6 +450,8 @@ class FullAttentionSpec(AttentionSpec):
         )
         for spec in specs:
             for f in fields(AttentionSpec):
+                if not f.compare:
+                    continue
                 assert getattr(spec, f.name) == getattr(merged_spec, f.name), (
                     "All attention layers in the same KV cache group must have "
                     "the same attention spec."
@@ -446,6 +578,7 @@ class MLAAttentionSpec(FullAttentionSpec):
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
+            side_storage_spec=cls.merge_side_storage_specs(specs),
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             dtype=specs[0].dtype,
@@ -461,6 +594,8 @@ class MLAAttentionSpec(FullAttentionSpec):
         )
         for spec in specs:
             for f in fields(AttentionSpec):
+                if not f.compare:
+                    continue
                 assert getattr(spec, f.name) == getattr(merged_spec, f.name), (
                     "All attention layers in the same KV cache group must have "
                     "the same attention spec."
@@ -501,6 +636,7 @@ class RSWASpec(FullAttentionSpec):
         base = FullAttentionSpec.merge(specs)  # type: ignore[arg-type]
         return cls(
             block_size=base.block_size,
+            side_storage_spec=base.side_storage_spec,
             num_kv_heads=base.num_kv_heads,
             head_size=base.head_size,
             head_size_v=base.head_size_v,
@@ -559,10 +695,35 @@ class ChunkedLocalAttentionSpec(AttentionSpec):
 class SlidingWindowSpec(AttentionSpec):
     sliding_window: int
     head_size_v: int = None  # type: ignore[assignment]
+    # Tokens retained below the active window for draft-layer re-prefill.
+    extra_retained_tokens: int = 0
 
     def __post_init__(self):
         if self.head_size_v is None:
             object.__setattr__(self, "head_size_v", self.head_size)
+
+    def retained_window_size(
+        self,
+        scheduler_block_size: int | None = None,
+        retain_eagle_proof: bool = False,
+    ) -> int:
+        """Return the live KV span needed below the current position."""
+        if not retain_eagle_proof:
+            return self.sliding_window + self.extra_retained_tokens
+
+        if scheduler_block_size is None:
+            scheduler_block_size = self.block_size
+        if scheduler_block_size <= 0:
+            raise ValueError("scheduler_block_size must be positive")
+
+        # Prefix hits land on scheduler-block boundaries. Keep the SWA window,
+        # one EAGLE proof block, and worst-case drift from the latest boundary.
+        window_blocks = cdiv(self.sliding_window - 1, self.block_size)
+        proof_blocks = 1
+        drift_blocks = cdiv(scheduler_block_size, self.block_size)
+        return (
+            window_blocks + proof_blocks + drift_blocks
+        ) * self.block_size + self.extra_retained_tokens
 
     @property
     def real_page_size_bytes(self) -> int:
@@ -585,7 +746,11 @@ class SlidingWindowSpec(AttentionSpec):
         )
 
     def max_admission_blocks_per_request(
-        self, max_in_flight_tokens: int, max_model_len: int
+        self,
+        max_in_flight_tokens: int,
+        max_model_len: int,
+        scheduler_block_size: int | None = None,
+        retain_eagle_proof: bool = False,
     ) -> int:
         """Per-request admission cap, in blocks.
 
@@ -598,10 +763,17 @@ class SlidingWindowSpec(AttentionSpec):
         `max_in_flight_tokens` is the max tokens scheduled but not yet settled
         (one batch per concurrent step); see `VllmConfig.max_in_flight_tokens`.
         """
-        # During chunked prefill, we hold KV for the last `sliding_window-1`
-        # computed tokens plus the in-flight tokens (frees happen on the
-        # processed-token basis); never more than `max_model_len`.
-        num_tokens = min(self.sliding_window - 1 + max_in_flight_tokens, max_model_len)
+        retained_window = self.retained_window_size(
+            scheduler_block_size=scheduler_block_size,
+            retain_eagle_proof=retain_eagle_proof,
+        )
+        # During chunked prefill, hold the retained local span plus in-flight
+        # tokens. The retained span includes any MTP re-prefill and prefix
+        # proof tails.
+        num_tokens = min(
+            retained_window - 1 + max_in_flight_tokens,
+            max_model_len,
+        )
         # +1 because the sliding window may not start from the beginning of
         # the block. E.g. block size 4 and num_token 4 needs two blocks
         # [XXCD][EF] to store the 6-token window [CDEF].
@@ -623,6 +795,7 @@ class SlidingWindowSpec(AttentionSpec):
         return all(
             isinstance(spec, SlidingWindowSpec)
             and spec.sliding_window == self.sliding_window
+            and spec.extra_retained_tokens == self.extra_retained_tokens
             for spec in kv_cache_specs.values()
         )
 
@@ -672,25 +845,29 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         model_version_set = set(spec.model_version for spec in specs)
         sliding_window_set = set(spec.sliding_window for spec in specs)
         block_stride_set = set(spec.indexes_kv_by_block_stride for spec in specs)
+        extra_retained_set = set(spec.extra_retained_tokens for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
             and len(sliding_window_set) == 1
             and len(block_stride_set) == 1
+            and len(extra_retained_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
             "quantization method, compress ratio, model version, sliding "
-            "window size, and KV block stride indexing."
+            "window size, KV block stride indexing, and retained token count."
         )
         return cls(
             block_size=specs[0].block_size,
+            side_storage_spec=cls.merge_side_storage_specs(specs),
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             dtype=specs[0].dtype,
             page_size_padded=specs[0].page_size_padded,
             indexes_kv_by_block_stride=block_stride_set.pop(),
             sliding_window=sliding_window_set.pop(),
+            extra_retained_tokens=extra_retained_set.pop(),
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
@@ -702,6 +879,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         return all(
             isinstance(spec, SlidingWindowMLASpec)
             and spec.sliding_window == self.sliding_window
+            and spec.extra_retained_tokens == self.extra_retained_tokens
             for spec in kv_cache_specs.values()
         )
 
@@ -806,6 +984,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
+            side_storage_spec=cls.merge_side_storage_specs(specs),
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             head_size_v=specs[0].head_size_v,
@@ -820,6 +999,8 @@ class SinkFullAttentionSpec(FullAttentionSpec):
         )
         for spec in specs:
             for f in fields(AttentionSpec):
+                if not f.compare:
+                    continue
                 assert getattr(spec, f.name) == getattr(merged_spec, f.name), (
                     "All attention layers in the same KV cache group must have "
                     "the same attention spec."
@@ -844,6 +1025,32 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
 
     kv_cache_specs: dict[str, KVCacheSpec]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "side_storage_spec",
+            KVCacheSideStorageSpec(
+                requires_zeroing=any(
+                    spec.requires_zeroing for spec in self.kv_cache_specs.values()
+                ),
+                extra_budget_page_size_bytes=sum(
+                    spec.extra_budget_page_size_bytes
+                    for spec in self.kv_cache_specs.values()
+                ),
+                extra_budget_fixed_size_bytes=sum(
+                    spec.extra_budget_fixed_size_bytes
+                    for spec in self.kv_cache_specs.values()
+                ),
+                prefix_cache_recompute_tokens=max(
+                    (
+                        spec.prefix_cache_recompute_tokens
+                        for spec in self.kv_cache_specs.values()
+                    ),
+                    default=0,
+                ),
+            ),
+        )
+
     @property
     def page_size_bytes(self) -> int:
         return sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())
@@ -866,6 +1073,20 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         block_sizes = set(spec.block_size for spec in kv_cache_specs.values())
         if len(block_sizes) > 1:
             # Different block sizes, not uniform.
+            return False
+        side_budgets = {
+            (
+                spec.extra_budget_page_size_bytes,
+                spec.extra_budget_fixed_size_bytes,
+            )
+            for spec in kv_cache_specs.values()
+        }
+        if len(side_budgets) > 1:
+            # A UniformTypeKVCacheSpecs group is collapsed to one
+            # representative spec for the scheduler. Layers with different
+            # side-storage budgets would then lose their per-layer physical
+            # allocation contract. A zeroing requirement, by contrast, safely
+            # aggregates at group level.
             return False
         first_spec = next(iter(kv_cache_specs.values()))
         return first_spec.is_uniform_with_collection(kv_cache_specs)
@@ -1011,12 +1232,18 @@ class KVCacheConfig:
         return len(kv_cache_precisions) > 1
 
     @property
-    def needs_kv_cache_zeroing(self) -> bool:
-        """Whether newly allocated KV cache blocks must be zeroed before use.
-
-        Required for Mamba layers, whose state is read before it is fully written
-        (#35219), and for mixed-precision caches, where a block reused across
-        groups can be reinterpreted under a different precision and decode stale
-        bytes to NaN/Inf. Uniform-precision caches skip zeroing.
-        """
+    def needs_base_kv_cache_zeroing(self) -> bool:
+        """Whether newly allocated main KV pages must be zeroed before use."""
         return self.has_mamba_layers or self.has_mixed_precision_kv_cache
+
+    @property
+    def needs_kv_cache_zeroing(self) -> bool:
+        """Whether any main-KV or side-storage reset hook must run.
+
+        Main KV pages are cleared only for Mamba/mixed-precision safety.
+        ``KVCacheSpec.requires_zeroing`` is side-storage metadata and must not
+        turn a sidecar reset into a full-page write over every attention layer.
+        """
+        return self.needs_base_kv_cache_zeroing or any(
+            group.kv_cache_spec.requires_zeroing for group in self.kv_cache_groups
+        )

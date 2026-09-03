@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -42,7 +43,10 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
-from vllm.v1.simple_kv_offload.manager import SimpleCPUOffloadScheduler
+from vllm.v1.simple_kv_offload.manager import (
+    SimpleCPUOffloadScheduler,
+    StoreRequestState,
+)
 from vllm.v1.simple_kv_offload.metadata import SimpleCPUOffloadWorkerMetadata
 
 # ---------------------------------------------------------------------------
@@ -1089,6 +1093,62 @@ def test_multi_group_null_blocks_skipped() -> None:
     assert null_block_id not in meta2.load_gpu_blocks, (
         f"Null block id {null_block_id} should not appear in load transfer pairs"
     )
+
+
+def test_eager_store_waits_for_multi_module_mtp_finalized_tail() -> None:
+    gpu_pool = BlockPool(
+        num_gpu_blocks=4,
+        enable_caching=True,
+        hash_block_size=BLOCK_SIZE,
+    )
+    cpu_pool = BlockPool(
+        num_gpu_blocks=4,
+        enable_caching=True,
+        hash_block_size=BLOCK_SIZE,
+    )
+    request = make_request(num_blocks=1, extra_tokens=4)
+    [gpu_block] = gpu_pool.get_new_blocks(1)
+
+    scheduler = object.__new__(SimpleCPUOffloadScheduler)
+    scheduler._gpu_block_pool = gpu_pool
+    scheduler.cpu_block_pool = cpu_pool
+    scheduler.cpu_kv_cache_config = _make_kv_cache_config(num_blocks=4)
+    scheduler._in_flight_store_gpu_blocks = set()
+    scheduler._reqs_to_store = {
+        request.request_id: StoreRequestState(
+            request=request,
+            block_ids=([],),
+            num_stored_blocks=[0],
+        )
+    }
+    scheduler.block_size = BLOCK_SIZE
+    scheduler.cp_world_size = 1
+    scheduler.cpu_coordinator = SimpleNamespace(num_reprefillable_tokens=2)
+
+    request.num_computed_tokens = BLOCK_SIZE
+    first_output = make_scheduler_output(
+        {request.request_id: BLOCK_SIZE},
+        new_reqs={request.request_id: ([gpu_block.block_id],)},
+    )
+    gpu_ids, _, _ = scheduler._prepare_eager_store_specs(first_output)
+    assert gpu_ids == []
+    assert scheduler._reqs_to_store[request.request_id].num_stored_blocks == [0]
+
+    gpu_block._block_hash = make_block_hash_with_group_id(
+        request.block_hashes[0],
+        0,
+    )
+    request.num_computed_tokens += 2
+    second_output = make_scheduler_output(
+        {request.request_id: 2},
+        cached_req_new_blocks={request.request_id: None},
+    )
+    gpu_ids, cpu_ids, req_ids = scheduler._prepare_eager_store_specs(second_output)
+
+    assert gpu_ids == [gpu_block.block_id]
+    assert len(cpu_ids) == 1
+    assert req_ids == [request.request_id]
+    assert scheduler._reqs_to_store[request.request_id].num_stored_blocks == [1]
 
 
 # ---------------------------------------------------------------------------

@@ -526,8 +526,10 @@ class SwigluStepAndMul(CustomOp):
         return: (num_tokens, d) or (batch_size, seq_len, d)
     """
 
-    def __init__(self, limit: float = 7.0):
-        super().__init__()
+    # Step4 compiles the native path; other callers retain the default custom
+    # op behavior.
+    def __init__(self, limit: float = 7.0, *, compile_native: bool = False):
+        super().__init__(compile_native=compile_native)
         if limit is None:
             raise ValueError("SwigluStepAndMul requires limit to be set.")
         self.limit = limit

@@ -343,7 +343,9 @@ class MultiprocExecutor(Executor):
         )
 
     def execute_dummy_batch(self) -> None:
-        self.collective_rpc("execute_dummy_batch", unique_reply_rank=self.output_rank)
+        # Dummy forwards have no sampler collective to align local TP workers.
+        # Drain every response before another DP/EP collective can be issued.
+        self.collective_rpc("execute_dummy_batch")
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         # OPTIMIZATION: Get output only from a single worker (output_rank)

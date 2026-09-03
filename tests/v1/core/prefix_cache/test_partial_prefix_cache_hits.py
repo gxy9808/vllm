@@ -640,8 +640,12 @@ def test_hybrid_mamba_partial_tail_owner_continue_preserves_later_hit():
     req0.append_output_token_ids([3])
     assert manager.allocate_slots(req0, 1) is not None
     # The owner moved the prefix-cache entry to a private copy; capture its id.
-    owner_copies, _ = manager.take_kv_cache_block_copies()
+    owner_copies, owner_copies_by_group, _ = (
+        manager.take_kv_cache_block_copies_by_group()
+    )
     cow_copy = next(c for c in owner_copies if c.src_block_id == partial_mamba_block_id)
+    assert owner_copies_by_group[0] == []
+    assert cow_copy in owner_copies_by_group[1]
     moved_block_id = cow_copy.dst_block_id
     manager.new_step_starts()
 

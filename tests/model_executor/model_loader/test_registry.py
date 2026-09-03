@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
+import torch
 from torch import nn
 
 from vllm.config import ModelConfig
@@ -59,6 +60,59 @@ def test_default_loader_rejects_multithread_with_non_lazy_strategy():
                 model_loader_extra_config={"enable_multithread_load": True},
             )
         )
+
+
+@pytest.mark.parametrize(
+    ("quantization", "model_opt_in", "explicit_setting", "expected"),
+    [
+        (None, False, None, True),
+        ("fp8", False, None, False),
+        ("fp8", True, None, True),
+        ("fp8", True, False, False),
+    ],
+)
+def test_default_loader_weights_track_default(
+    monkeypatch,
+    quantization,
+    model_opt_in,
+    explicit_setting,
+    expected,
+):
+    class _Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty(1))
+            self._enable_weights_track_by_default = model_opt_in
+
+        def load_weights(self, _weights):
+            return set()
+
+    extra_config = (
+        {} if explicit_setting is None else {"enable_weights_track": explicit_setting}
+    )
+    loader = DefaultModelLoader(LoadConfig(model_loader_extra_config=extra_config))
+    model = _Model()
+    model_config = type(
+        "_ModelConfig",
+        (),
+        {"quantization": quantization},
+    )()
+    track_calls = []
+    monkeypatch.setattr(loader, "_init_ep_weight_filter", lambda _: None)
+    monkeypatch.setattr(loader, "get_all_weights", lambda *_: ())
+    monkeypatch.setattr(
+        loader,
+        "track_weights_loading",
+        lambda loaded_model, loaded_weights: track_calls.append(
+            (loaded_model, loaded_weights)
+        ),
+    )
+
+    loader.load_weights(model, model_config)
+
+    assert bool(track_calls) is expected
+    if expected:
+        assert track_calls == [(model, set())]
 
 
 def test_default_loader_explicit_safetensors_does_not_misread_pt(tmp_path):

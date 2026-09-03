@@ -17,7 +17,11 @@ build-backend = "setuptools.build_meta"
 name = "vllm"
 authors = [{name = "vLLM Team"}]
 license = "Apache-2.0"
-license-files = ["LICENSE"]
+license-files = [
+    "LICENSE",
+    "OPTIMUS_JIT_VENDOR_NOTICE.md",
+    "OPTIMUS_JIT_VENDOR_MANIFEST.tsv",
+]
 readme = "README.md"
 description = "A high-throughput and memory-efficient inference and serving engine for LLMs"
 classifiers = [
@@ -54,8 +58,20 @@ lora_hf_hub_resolver = "vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_
 where = ["."]
 include = ["vllm*"]
 
+[tool.ruff]
+# The Step4 inference-only Optimus kernel closure is model-scoped. In
+# particular, CuTeDSL staged kernels are source-inspected during JIT
+# compilation, so formatting them can change preprocessing semantics.
+extend-exclude = [
+    "vllm/models/step4/nvidia/ops/cute_dsl",
+    "vllm/models/step4/nvidia/ops/triton",
+]
+
 [tool.ruff.lint.per-file-ignores]
 "vllm/third_party/**" = ["ALL"]
+# Model-scoped vendored Optimus inference kernels.
+"vllm/models/step4/nvidia/ops/cute_dsl/**" = ["ALL"]
+"vllm/models/step4/nvidia/ops/triton/**" = ["ALL"]
 "vllm/version.py" = ["F401"]
 "vllm/_version.py" = ["ALL"]
 

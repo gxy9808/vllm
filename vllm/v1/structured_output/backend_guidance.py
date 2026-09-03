@@ -93,6 +93,14 @@ class GuidanceBackend(StructuredOutputBackend):
         self.disable_additional_properties = (
             self.vllm_config.structured_outputs_config.disable_additional_properties
         )
+        self._has_valid_vocab_boundary = (
+            getattr(
+                self.vllm_config.model_config,
+                "valid_vocab_size",
+                None,
+            )
+            is not None
+        )
 
         if is_mistral_tokenizer(self.tokenizer):
             self.ll_tokenizer = self.tokenizer.llg_tokenizer
@@ -101,8 +109,14 @@ class GuidanceBackend(StructuredOutputBackend):
 
             self.ll_tokenizer = from_mistral_tokenizer(self.tokenizer.tokenizer)
         else:
+            tokenizer_vocab_size = (
+                self.vocab_size
+                if self._has_valid_vocab_boundary
+                else max(self.vocab_size, len(self.tokenizer))
+            )
             self.ll_tokenizer = llguidance_hf.from_tokenizer(
-                self.tokenizer, max(self.vocab_size, len(self.tokenizer))
+                self.tokenizer,
+                tokenizer_vocab_size,
             )
 
     def compile_grammar(
@@ -131,9 +145,16 @@ class GuidanceBackend(StructuredOutputBackend):
         return r
 
     def allocate_token_bitmask(self, max_num_seqs: int):
-        return llguidance_torch.allocate_token_bitmask(
-            max_num_seqs, self.ll_tokenizer.vocab_size
+        # Mistral tokenizer adapters expose their complete tokenizer vocabulary
+        # and do not accept an effective-vocabulary argument at construction.
+        # Keep the legacy full-tokenizer mask for ordinary models, but never
+        # widen an explicitly resolved model vocabulary boundary.
+        mask_vocab_size = (
+            self.vocab_size
+            if self._has_valid_vocab_boundary
+            else self.ll_tokenizer.vocab_size
         )
+        return llguidance_torch.allocate_token_bitmask(max_num_seqs, mask_vocab_size)
 
     def destroy(self):
         pass

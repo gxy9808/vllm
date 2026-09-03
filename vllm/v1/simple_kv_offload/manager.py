@@ -92,6 +92,13 @@ class SimpleCPUOffloadScheduler:
         self.cpu_kv_cache_config = self._derive_cpu_config(
             kv_cache_config, cpu_capacity_bytes
         )
+        self.prefix_cache_recompute_tokens = max(
+            (
+                group.kv_cache_spec.prefix_cache_recompute_tokens
+                for group in self.cpu_kv_cache_config.kv_cache_groups
+            ),
+            default=0,
+        )
         self.num_cpu_blocks = self.cpu_kv_cache_config.num_blocks
         # Find the full attention kv group for prefix cache matching.
         self.fa_gidx = -1
@@ -119,6 +126,11 @@ class SimpleCPUOffloadScheduler:
 
         spec_config = vllm_config.speculative_config
         use_eagle = spec_config is not None and spec_config.use_eagle()
+        num_prefill_lookahead = (
+            spec_config.num_speculative_tokens
+            if spec_config is not None and spec_config.use_multi_module_mtp()
+            else int(use_eagle)
+        )
         self.cpu_coordinator: KVCacheCoordinator = get_kv_cache_coordinator(
             kv_cache_config=self.cpu_kv_cache_config,
             max_model_len=vllm_config.model_config.max_model_len,
@@ -130,6 +142,7 @@ class SimpleCPUOffloadScheduler:
             pcp_world_size=1,
             scheduler_block_size=self.block_size,
             hash_block_size=self.hash_block_size,
+            num_prefill_lookahead=num_prefill_lookahead,
         )
         self.cpu_block_pool: BlockPool = self.cpu_coordinator.block_pool
         # GPU block pool reference - bound after scheduler builds kv_cache_manager
@@ -256,14 +269,30 @@ class SimpleCPUOffloadScheduler:
 
         if not remaining_hashes:
             return 0, False
-        # Must recompute at least the last token, matching the logic in
-        # kv_cache_manager.get_computed_blocks().
-        max_hit_len = request.num_tokens - 1 - num_computed_tokens
-        if max_hit_len <= 0:
+        # Keep the ordinary logits lookup ceiling separate from a model's
+        # stricter replay ceiling.  EAGLE/MTP lookup may inspect one extra
+        # unit, but the final local+remote prefix is clamped by the scheduler.
+        lookup_ceiling = request.num_tokens - 1 - num_computed_tokens
+        required = max(1, self.prefix_cache_recompute_tokens)
+        returned_ceiling = request.num_tokens - required - num_computed_tokens
+        if lookup_ceiling <= 0 or returned_ceiling <= 0:
             return 0, False
-        cpu_hit_blocks, hit_length, _ = self.cpu_coordinator.find_longest_cache_hit(
-            remaining_hashes, max_hit_len
-        )
+        returned_ceiling = min(lookup_ceiling, returned_ceiling)
+        if returned_ceiling == lookup_ceiling:
+            cpu_hit_blocks, hit_length, _ = (
+                self.cpu_coordinator.find_longest_cache_hit(
+                    remaining_hashes,
+                    lookup_ceiling,
+                )
+            )
+        else:
+            cpu_hit_blocks, hit_length, _ = (
+                self.cpu_coordinator.find_longest_cache_hit(
+                    remaining_hashes,
+                    lookup_ceiling,
+                    returned_ceiling,
+                )
+            )
 
         if hit_length > 0:
             pin_blocks = [
@@ -577,7 +606,12 @@ class SimpleCPUOffloadScheduler:
             out_of_space = False
             # Confirmed tokens: KV data written and visible to all streams.
             req = state.request
-            confirmed_tokens = req.num_computed_tokens - req.num_output_placeholders
+            confirmed_tokens = max(
+                0,
+                req.num_computed_tokens
+                - req.num_output_placeholders
+                - self.cpu_coordinator.num_reprefillable_tokens,
+            )
             # Cap to blocks with confirmed KV data.
             aligned_tokens = confirmed_tokens // self.block_size * self.block_size
 

@@ -51,6 +51,7 @@ if current_platform.is_cuda_alike():
 if current_platform.is_cuda():
     from .fusion.allreduce_rms_fusion import AllReduceFusionPass
     from .fusion.collective_fusion import AsyncTPPass
+    from .fusion.optimus_rms_fusion import OptimusRMSNormFusionPass
 
 if current_platform.is_xpu():
     from .fusion.act_quant_fusion import ActivationQuantFusionPass
@@ -176,6 +177,9 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
                     self.passes += [RocmAiterAllReduceFusionPass(config)]
                 else:
                     self.passes += [AllReduceFusionPass(config)]
+
+            if self.pass_config.fuse_optimus_rms:
+                self.passes += [OptimusRMSNormFusionPass(config)]
 
             if enable_transformers_norm_canonicalization:
                 # Let AR+RMS match before moving output reshapes ahead of the

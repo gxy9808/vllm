@@ -546,6 +546,10 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
         # Initialize at least one MoE layer
         hf_overrides={"num_hidden_layers": 4},
     ),
+    "Step4ForCausalLM": _HfExamplesInfo(
+        "stepfun-ai/Step-4",
+        is_available_online=False,
+    ),
     "Step3TextForCausalLM": _HfExamplesInfo("stepfun-ai/step3", trust_remote_code=True),
     "SolarForCausalLM": _HfExamplesInfo(
         "upstage/solar-pro-preview-instruct", trust_remote_code=True
@@ -1736,6 +1740,11 @@ _SPECULATIVE_DECODING_EXAMPLE_MODELS = {
         use_original_num_layers=True,
         # Initialize at least one MoE layer
         hf_overrides={"num_hidden_layers": 4},
+        is_available_online=False,
+    ),
+    "Step4MTP": _HfExamplesInfo(
+        "stepfun-ai/Step-4",
+        speculative_model="stepfun-ai/Step-4",
         is_available_online=False,
     ),
 }

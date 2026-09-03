@@ -5,6 +5,7 @@ import itertools
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+from functools import cache, wraps
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, overload
 
 import regex as re
@@ -18,10 +19,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader.reload import (
-    support_quantized_model_reload_from_hp_weights,
-)
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import supports_any_eagle
 from vllm.multimodal import NestedTensors
 from vllm.sequence import IntermediateTensors
@@ -41,6 +38,25 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 ShardId: TypeAlias = str | int | tuple[int, ...]
+
+
+@cache
+def _get_quantized_reload_wrapper(func: Callable) -> Callable:
+    from vllm.model_executor.model_loader.reload import (
+        support_quantized_model_reload_from_hp_weights,
+    )
+
+    return support_quantized_model_reload_from_hp_weights(func)
+
+
+def _lazy_support_quantized_model_reload_from_hp_weights(func: Callable):
+    @wraps(func)
+    def wrapper(self, weights, *args, **kwargs):
+        if not getattr(self.module, "_do_torchao_reload", False):
+            return func(self, weights, *args, **kwargs)
+        return _get_quantized_reload_wrapper(func)(self, weights, *args, **kwargs)
+
+    return wrapper
 
 
 @dataclass
@@ -258,6 +274,10 @@ class AutoWeightsLoader:
         param: nn.Parameter,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> Iterable[str]:
+        from vllm.model_executor.model_loader.weight_utils import (
+            default_weight_loader,
+        )
+
         for weight_name, weight_data in weights:
             weight_qualname = self._get_qualname(base_prefix, weight_name)
 
@@ -394,7 +414,7 @@ class AutoWeightsLoader:
                 )
                 raise ValueError(msg)
 
-    @support_quantized_model_reload_from_hp_weights
+    @_lazy_support_quantized_model_reload_from_hp_weights
     def load_weights(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
