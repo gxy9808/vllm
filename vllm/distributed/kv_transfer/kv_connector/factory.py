@@ -216,6 +216,12 @@ KVConnectorFactory.register_connector(
 )
 
 KVConnectorFactory.register_connector(
+    "PreFilledDecodeBenchConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.prefilled_decode_bench_connector",
+    "PreFilledDecodeBenchConnector",
+)
+
+KVConnectorFactory.register_connector(
     "MooncakeConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector",
     "MooncakeConnector",
