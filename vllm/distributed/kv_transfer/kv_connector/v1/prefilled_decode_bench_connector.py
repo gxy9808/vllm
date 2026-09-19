@@ -7,6 +7,9 @@ bottlenecks on models with many layers like Step4), this connector fills the
 ENTIRE KV cache pool once during initialization. Subsequent requests simply
 claim pre-filled blocks without any per-request fill overhead.
 
+It reuses DecodeBenchConnector's scheduler logic (which is proven to correctly
+skip prefill) and only replaces the worker's fill strategy.
+
 Usage:
     vllm serve <model> --kv-transfer-config '{
         "kv_connector": "PreFilledDecodeBenchConnector",
@@ -36,7 +39,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     SupportsHMA,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.decode_bench_connector import (
+    DecodeBenchConnector,
+    DecodeBenchConnectorScheduler,
+)
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionMetadata
 
 if TYPE_CHECKING:
@@ -61,17 +69,12 @@ _FLOAT8_DTYPES = {
 }
 
 
-@dataclass
-class PreFilledDecodeBenchConnectorMetadata(KVConnectorMetadata):
-    """Metadata for PreFilledDecodeBenchConnector (empty, no per-req fill)."""
-    pass
-
-
-class PreFilledDecodeBenchConnector(KVConnectorBase_V1, SupportsHMA):
+class PreFilledDecodeBenchConnector(DecodeBenchConnector):
     """A KV Connector that pre-fills the entire KV cache pool at init.
 
-    Fills all KV caches with dummy values once during register_kv_caches.
-    Subsequent requests claim pre-filled blocks without any fill overhead.
+    Inherits all scheduler logic from DecodeBenchConnector (proven to correctly
+    skip prefill). Only overrides the worker to pre-fill the entire pool once
+    at init, instead of per-request serial filling.
     """
 
     def __init__(
@@ -82,97 +85,30 @@ class PreFilledDecodeBenchConnector(KVConnectorBase_V1, SupportsHMA):
     ):
         super().__init__(vllm_config, role, kv_cache_config)
 
-        self.connector_scheduler = None
-        self.connector_worker = None
-
-        if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler = _Scheduler(vllm_config)
-        elif role == KVConnectorRole.WORKER:
-            self.connector_worker = _Worker(vllm_config)
+        if role == KVConnectorRole.WORKER:
+            # Replace the per-request worker with our pre-fill worker
+            self.connector_worker = _PreFilledWorker(vllm_config)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
 
-    def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
-        pass
 
-    def wait_for_layer_load(self, layer_name: str) -> None:
-        pass
+class _PreFilledWorker:
+    """Worker that pre-fills the entire KV cache pool at registration time.
 
-    def save_kv_layer(self, layer_name: str, kv_layer: torch.Tensor,
-                      attn_metadata: AttentionMetadata, **kwargs: Any) -> None:
-        pass
+    After init, start_fill_kv is a no-op: blocks are already filled.
+    """
 
-    def wait_for_save(self):
-        pass
-
-    def get_num_new_matched_tokens(
-        self, request: "Request", num_computed_tokens: int
-    ) -> tuple[int | None, bool]:
-        assert self.connector_scheduler is not None
-        return self.connector_scheduler.get_num_new_matched_tokens(
-            request, num_computed_tokens
-        )
-
-    def update_state_after_alloc(
-        self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
-    ):
-        assert self.connector_scheduler is not None
-        return self.connector_scheduler.update_state_after_alloc(
-            request, blocks, num_external_tokens
-        )
-
-    def build_connector_meta(
-        self, scheduler_output: "SchedulerOutput"
-    ) -> KVConnectorMetadata:
-        return PreFilledDecodeBenchConnectorMetadata()
-
-    def request_finished(
-        self, request: "Request", block_ids: list[int]
-    ) -> tuple[bool, dict[str, Any] | None]:
-        assert self.connector_scheduler is not None
-        self.connector_scheduler.request_finished(request)
-        return False, None
-
-    def request_finished_all_groups(
-        self, request: "Request", block_ids: tuple[list[int], ...]
-    ) -> tuple[bool, dict[str, Any] | None]:
-        assert self.connector_scheduler is not None
-        self.connector_scheduler.request_finished(request)
-        return False, None
-
-
-class _Scheduler:
     def __init__(self, vllm_config: "VllmConfig"):
-        self._filled_requests: set[str] = set()
+        self.vllm_config = vllm_config
+        self.block_size = vllm_config.cache_config.block_size
 
-    def get_num_new_matched_tokens(
-        self, request: "Request", num_computed_tokens: int
-    ) -> tuple[int, bool]:
-        req_id = request.request_id
-        if req_id in self._filled_requests:
-            return 0, False
-        num_uncomputed = request.num_tokens - num_computed_tokens
-        num_to_fill = max(0, num_uncomputed - 1)
-        return num_to_fill, False
-
-    def update_state_after_alloc(
-        self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
-    ):
-        if num_external_tokens > 0:
-            self._filled_requests.add(request.request_id)
-
-    def request_finished(self, request: "Request"):
-        self._filled_requests.discard(request.request_id)
-
-
-class _Worker:
-    def __init__(self, vllm_config: "VllmConfig"):
         kv_transfer_config = vllm_config.kv_transfer_config
         assert kv_transfer_config is not None
         self.fill_mean = kv_transfer_config.get_from_extra_config("fill_mean", 0.015)
         self.fill_std = kv_transfer_config.get_from_extra_config("fill_std", 0.0)
+
         self.kv_caches: dict[str, torch.Tensor] | None = None
         self._pool_filled = False
 
@@ -222,3 +158,7 @@ class _Worker:
                             t.fill_(self.fill_mean)
         self._pool_filled = True
         logger.info("PreFilledDecodeBenchConnector: KV cache pool pre-fill complete.")
+
+    def start_fill_kv(self, metadata):
+        # No-op: entire pool is already filled at init
+        logger.debug("PreFilledDecodeBenchConnector: start_fill_kv called (no-op, pool pre-filled)")
