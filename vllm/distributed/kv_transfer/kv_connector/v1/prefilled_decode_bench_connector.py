@@ -72,9 +72,11 @@ _FLOAT8_DTYPES = {
 class PreFilledDecodeBenchConnector(DecodeBenchConnector):
     """A KV Connector that pre-fills the entire KV cache pool at init.
 
-    Inherits all scheduler logic from DecodeBenchConnector (proven to correctly
-    skip prefill). Only overrides the worker to pre-fill the entire pool once
-    at init, instead of per-request serial filling.
+    Inherits all worker/scheduler structure from DecodeBenchConnector.
+    Two key changes:
+    1. Worker: pre-fills entire KV pool at register_kv_caches, start_fill_kv is no-op.
+    2. Scheduler: claims ALL tokens as matched (including the last decode token),
+       so scheduler fully skips prefill and goes straight to decode.
     """
 
     def __init__(
@@ -86,12 +88,38 @@ class PreFilledDecodeBenchConnector(DecodeBenchConnector):
         super().__init__(vllm_config, role, kv_cache_config)
 
         if role == KVConnectorRole.WORKER:
-            # Replace the per-request worker with our pre-fill worker
             self.connector_worker = _PreFilledWorker(vllm_config)
+        elif role == KVConnectorRole.SCHEDULER:
+            # Replace scheduler with one that claims all tokens matched
+            self.connector_scheduler = _AllMatchedScheduler(vllm_config)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
+
+
+class _AllMatchedScheduler(DecodeBenchConnectorScheduler):
+    """Scheduler that claims ALL uncomputed tokens as matched.
+
+    Unlike the parent class which leaves the last token for decode,
+    this claims everything so the scheduler fully skips prefill.
+    """
+
+    def get_num_new_matched_tokens(
+        self, request: "Request", num_computed_tokens: int
+    ) -> tuple[int, bool]:
+        req_id = request.request_id
+        if req_id in self._filled_requests:
+            return 0, False
+
+        num_uncomputed = request.num_tokens - num_computed_tokens
+        if num_uncomputed <= 1:
+            return 0, False
+
+        # Claim ALL tokens as matched (not num_uncomputed - 1)
+        # This tells the scheduler the entire prefill is done,
+        # so it goes straight to decode for the last token.
+        return num_uncomputed, False
 
 
 class _PreFilledWorker:
