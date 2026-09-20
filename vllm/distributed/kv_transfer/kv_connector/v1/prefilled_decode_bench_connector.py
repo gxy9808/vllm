@@ -75,8 +75,9 @@ class PreFilledDecodeBenchConnector(DecodeBenchConnector):
     Inherits all worker/scheduler structure from DecodeBenchConnector.
     Two key changes:
     1. Worker: pre-fills entire KV pool at register_kv_caches, start_fill_kv is no-op.
-    2. Scheduler: claims ALL tokens as matched (including the last decode token),
-       so scheduler fully skips prefill and goes straight to decode.
+    2. Scheduler: claims every skippable token as matched, leaving only the
+       model's prefix-replay suffix (prefix_cache_recompute_tokens, e.g. one
+       block for Step4 DSA) for a single fast local prefill chunk.
     """
 
     def __init__(
@@ -90,20 +91,35 @@ class PreFilledDecodeBenchConnector(DecodeBenchConnector):
         if role == KVConnectorRole.WORKER:
             self.connector_worker = _PreFilledWorker(vllm_config)
         elif role == KVConnectorRole.SCHEDULER:
-            # Replace scheduler with one that claims all tokens matched
-            self.connector_scheduler = _AllMatchedScheduler(vllm_config)
+            # Replace scheduler with one that respects the replay contract
+            self.connector_scheduler = _ReplayAwareScheduler(
+                vllm_config, kv_cache_config
+            )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
 
 
-class _AllMatchedScheduler(DecodeBenchConnectorScheduler):
-    """Scheduler that claims ALL uncomputed tokens as matched.
+class _ReplayAwareScheduler(DecodeBenchConnectorScheduler):
+    """Scheduler that claims all tokens except the prefix-replay suffix.
 
-    Unlike the parent class which leaves the last token for decode,
-    this claims everything so the scheduler fully skips prefill.
+    A model-side replay contract (Step4 DSA sets prefix_cache_recompute_tokens
+    = block_size) makes the scheduler decline any connector hit longer than
+    num_tokens - prefix_cache_recompute_tokens (ext_tokens clamped to 0).
+    Claim up to that ceiling and leave the replay suffix for local compute,
+    so each request does one small prefill chunk and then decodes.
     """
+
+    def __init__(self, vllm_config: "VllmConfig", kv_cache_config: "KVCacheConfig"):
+        super().__init__(vllm_config)
+        self.prefix_cache_recompute_tokens = max(
+            (
+                group.kv_cache_spec.prefix_cache_recompute_tokens
+                for group in kv_cache_config.kv_cache_groups
+            ),
+            default=0,
+        )
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
@@ -113,13 +129,14 @@ class _AllMatchedScheduler(DecodeBenchConnectorScheduler):
             return 0, False
 
         num_uncomputed = request.num_tokens - num_computed_tokens
-        if num_uncomputed <= 1:
+        # Leave the replay suffix (at least the last token for logits) to
+        # local compute; a longer claim gets clamped to zero by the scheduler.
+        replay_suffix = max(1, self.prefix_cache_recompute_tokens)
+        num_to_claim = num_uncomputed - replay_suffix
+        if num_to_claim <= 0:
             return 0, False
 
-        # Claim ALL tokens as matched (not num_uncomputed - 1)
-        # This tells the scheduler the entire prefill is done,
-        # so it goes straight to decode for the last token.
-        return num_uncomputed, False
+        return num_to_claim, False
 
 
 class _PreFilledWorker:
