@@ -248,6 +248,8 @@ if TYPE_CHECKING:
     VLLM_EC_SIDE_CHANNEL_PORT: int = 0
     VLLM_MOONCAKE_BOOTSTRAP_PORT: int = 8998
     VLLM_MOONCAKE_STORE_TIER_LOG: bool = False
+    VLLM_KV_METRIC_LOG: bool = True
+    VLLM_STEP5_STAGE_TIMING: bool = False
     VLLM_MOONCAKE_STORE_SELECTIVE_LEASE: bool = False
     VLLM_MOONCAKE_LOAD_RECV_THREADS: int = 1
     VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO: float = 0.9
@@ -1859,6 +1861,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Log per-batch memory/disk tier breakdown on external GETs.
     "VLLM_MOONCAKE_STORE_TIER_LOG": lambda: (
         os.getenv("VLLM_MOONCAKE_STORE_TIER_LOG", "False").lower() in ("true", "1")
+    ),
+    # Log per-request KV store transfer stage timings
+    # (KV_GET/KV_SAVE/KV_LOOKUP/KV_LOAD_WAIT metrics).
+    "VLLM_KV_METRIC_LOG": lambda: (
+        os.getenv("VLLM_KV_METRIC_LOG", "True").lower() in ("true", "1")
+    ),
+    # Time Step5 forward stages (eager prefill) and log STEP5_STAGE_METRIC.
+    "VLLM_STEP5_STAGE_TIMING": lambda: (
+        os.getenv("VLLM_STEP5_STAGE_TIMING", "False").lower() in ("true", "1")
     ),
     # Probe prefix-lookup keys without a read lease and lease only the keys the
     # hit loads. Requires Mooncake >= 0.3.14.

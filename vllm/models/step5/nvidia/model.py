@@ -102,6 +102,48 @@ from .ops.attention_gate import headwise_sigmoid_gate
 
 logger = init_logger(__name__)
 
+_step5_stage_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+
+
+def _step5_stage_active() -> bool:
+    if torch.compiler.is_compiling() or not envs.VLLM_STEP5_STAGE_TIMING:
+        return False
+    # Timing is meaningless during cudagraph capture and replay.
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    return True
+
+
+def _step5_mark() -> torch.cuda.Event | None:
+    """Record a start event for an eager-prefill stage segment."""
+    if not _step5_stage_active() or len(_step5_stage_events) > 512:
+        return None
+    ev = torch.cuda.Event(enable_timing=True)
+    ev.record()
+    return ev
+
+
+def _step5_mark_end(name: str, start: torch.cuda.Event | None) -> None:
+    if start is None:
+        return
+    end = torch.cuda.Event(enable_timing=True)
+    end.record()
+    _step5_stage_events.append((name, start, end))
+
+
+def _step5_flush_stage_timings(num_tokens: int) -> None:
+    if not _step5_stage_events:
+        return
+    torch.cuda.synchronize()
+    sums: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for name, start, end in _step5_stage_events:
+        sums[name] = sums.get(name, 0.0) + start.elapsed_time(end)
+        counts[name] = counts.get(name, 0) + 1
+    _step5_stage_events.clear()
+    detail = " ".join(f"{n}={sums[n]:.2f}msx{counts[n]}" for n in sorted(sums))
+    logger.info("STEP5_STAGE_METRIC tokens=%d %s", num_tokens, detail)
+
 
 def _can_fuse_decode_aux(metadata, runtime_mode: CUDAGraphMode) -> bool:
     # BCG prefill reuses captured projections/norms. Keep decode-only state
@@ -1263,6 +1305,7 @@ class Step5Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        _m = _step5_mark()
         if self.use_dsa_backend:
             qkv, qkzg = self.qkv_indexer_proj(hidden_states)
             extra_dims = None
@@ -1278,7 +1321,9 @@ class Step5Attention(nn.Module):
 
         if self.fuse_swa_gate and extra_dims is None:
             extra_dims, _ = self.g_proj(hidden_states)
+        _step5_mark_end("attn_proj", _m)
 
+        _m = _step5_mark()
         attn_metadata, _, kv_cache, slot_mapping = get_attention_context(
             self.attn.layer_name
         )
@@ -1359,6 +1404,9 @@ class Step5Attention(nn.Module):
             k = k_by_head.view(k.shape)
             if self.use_rope:
                 q, k = self.rotary_emb(positions, q, k)
+        _step5_mark_end("attn_kv_prep", _m)
+
+        _m = _step5_mark()
         if self.sparse_attn is not None:
             attn_output, extra_dims = self.sparse_attn.forward(
                 positions,
@@ -1400,6 +1448,9 @@ class Step5Attention(nn.Module):
             attn_output = self.attn(q, None, None)
         else:
             attn_output = self.attn(q, k, v)
+        _step5_mark_end("attn_core", _m)
+
+        _m = _step5_mark()
         if extra_dims is None and self.use_head_wise_attn_gate:
             extra_dims, _ = self.g_proj(hidden_states)
 
@@ -1414,6 +1465,7 @@ class Step5Attention(nn.Module):
                 attn_output, extra_dims, slot_mapping=decode_slots
             )
         output, _ = self.o_proj(attn_output)
+        _step5_mark_end("attn_out", _m)
         return output
 
 
@@ -1983,7 +2035,9 @@ class Step5DecoderLayer(nn.Module):
         padding: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.use_moe:
+            _m = _step5_mark()
             shared_output, moe_output = self.moe(hidden_states, padding=padding)
+            _step5_mark_end("moe", _m)
             combined = (
                 moe_output
                 if shared_output is None
@@ -2025,6 +2079,7 @@ class Step5DecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
             hidden_states = self._cast_for_param_op(hidden_states)
 
+        _m = _step5_mark()
         if self.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]
         hidden_states = self.self_attn(
@@ -2033,6 +2088,7 @@ class Step5DecoderLayer(nn.Module):
         )
         if self.use_sequence_parallel:
             hidden_states = sp_reduce_scatter(hidden_states)
+        _step5_mark_end("layer_attn", _m)
         if self.fp32_residual_connection and isinstance(
             self.post_attention_layernorm, Step5RMSNorm
         ):
@@ -2046,7 +2102,9 @@ class Step5DecoderLayer(nn.Module):
             hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states = self._cast_for_param_op(hidden_states)
 
+        _m = _step5_mark()
         ffn_output = self._forward_ffn(hidden_states, padding=padding)
+        _step5_mark_end("layer_ffn", _m)
         return ffn_output, residual
 
 
@@ -2128,6 +2186,7 @@ class Step5Model(nn.Module):
             hidden_states, residual = layer(
                 positions, hidden_states, residual, padding=padding
             )
+        _step5_flush_stage_timings(positions.shape[0])
         if residual is not None:
             hidden_states = layer._add_for_residual(hidden_states, residual)
         if self.use_sequence_parallel:

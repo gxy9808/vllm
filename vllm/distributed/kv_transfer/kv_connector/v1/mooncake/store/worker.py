@@ -430,6 +430,39 @@ def _log_mooncake_load_tier_summary(
 # ============================================================
 
 
+def _log_kv_metric_grp(
+    tag: str,
+    req_id: str,
+    grp_keys: dict[int, int],
+    grp_bytes: dict[int, int],
+    grp_failed: dict[int, int],
+    group_specs: Sequence[tuple[str, int]],
+    denom_ms: float,
+) -> None:
+    """Per-cache-group breakdown line for the KV_*_METRIC logs."""
+    if not grp_keys:
+        return
+    for g in sorted(grp_keys):
+        name, block_size = (
+            group_specs[g] if g < len(group_specs) else ("unknown", 0)
+        )
+        bytes_ = grp_bytes.get(g, 0)
+        thr = bytes_ / 1024 / denom_ms if denom_ms > 0 else 0.0
+        logger.info(
+            "%s req=%s group=%d name=%s block_size=%d keys=%d bytes=%d "
+            "failed=%d thr_kbps=%.1f",
+            tag,
+            req_id,
+            g,
+            name,
+            block_size,
+            grp_keys[g],
+            bytes_,
+            grp_failed.get(g, 0),
+            thr,
+        )
+
+
 class KVTransferThread(threading.Thread):
     """Base class for async KV cache transfer threads."""
 
@@ -443,6 +476,7 @@ class KVTransferThread(threading.Thread):
         name: str,
         record_operation: Callable[..., None] | None = None,
         request_queue: queue.Queue[Any] | None = None,
+        group_specs: Sequence[tuple[str, int]] | None = None,
     ):
         super().__init__(daemon=True, name=name)
         self.store = store
@@ -451,6 +485,7 @@ class KVTransferThread(threading.Thread):
         self.tp_rank = tp_rank
         self.token_databases = token_databases
         self._record_operation_cb = record_operation
+        self.group_specs = list(group_specs) if group_specs is not None else []
         self.done_task_lock = threading.Lock()
         self.request_queue: queue.Queue[Any] = request_queue or queue.Queue()
         self.finished_requests: set[str] = set()
@@ -539,6 +574,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         supports_group_ids: bool = False,
         record_operation: Callable[..., None] | None = None,
         group_participates: Sequence[bool] | None = None,
+        group_specs: Sequence[tuple[str, int]] | None = None,
     ):
         super().__init__(
             store,
@@ -548,6 +584,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             ready_event,
             name="KVCacheStoreSendingThread",
             record_operation=record_operation,
+            group_specs=group_specs,
         )
         # Only ranks with identical group bytes may stripe PUTs (e.g., MLA).
         self.group_put_steps = group_put_steps
@@ -868,6 +905,16 @@ class KVCacheStoreSendingThread(KVTransferThread):
         req_id = req_meta.req_id
         event_token_ids = req_meta.token_ids
         token_ids_start = req_meta.token_ids_start
+        _m_start = time.perf_counter()
+        _m_key_build_ms = 0.0
+        _m_exists_ms = 0.0
+        _m_gpu_sync_ms = 0.0
+        _m_put_ms = 0.0
+        _m_keys = 0
+        _m_bytes = 0
+        _grp_keys: dict[int, int] = {}
+        _grp_bytes: dict[int, int] = {}
+        _grp_failed: dict[int, int] = {}
         try:
             lcm_block_size = self.coord.lcm_block_size
             available_token_len = req_meta.token_len_chunk
@@ -915,6 +962,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             ):
                 replay_boundary = checkpoint_len + 1
             # Successful saves advance by complete scheduler-aligned intervals.
+            _m_key_build_start = time.perf_counter()
             store_masks = self.coord.store_mask(
                 checkpoint_len,
                 save_start,
@@ -976,6 +1024,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         if event_specs is not None:
                             event_specs.append((start, end, g_idx, block_hash))
 
+            _m_key_build_ms = (time.perf_counter() - _m_key_build_start) * 1000
+            _m_keys = len(keys)
+
             if not keys:
                 save_completed = not missing_source_blocks
                 return
@@ -998,6 +1049,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 save_exists_start,
                 len(keys),
             )
+            _m_exists_ms = (time.perf_counter() - save_exists_start) * 1000
             missing_indices = [
                 i for i, exists in enumerate(exists_states) if exists != 1
             ]
@@ -1062,9 +1114,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 )
                 addrs.extend(group_addrs)
                 sizes.extend(group_sizes)
+                _grp_keys[g_idx] = len(group_sizes)
+                _grp_bytes[g_idx] = _sum_batch_bytes(group_sizes)
 
             if current_event is not None:
+                _m_gpu_sync_start = time.perf_counter()
                 current_event.synchronize()
+                _m_gpu_sync_ms = (time.perf_counter() - _m_gpu_sync_start) * 1000
 
             if group_ids is not None:
                 assert len(group_ids) == len(keys)
@@ -1073,6 +1129,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             failed_indices: set[int] = set()
             put_had_exception = False
             batch_bytes = _sum_batch_bytes(sizes)
+            _m_bytes = batch_bytes
             put_start = time.perf_counter()
             try:
                 res = self.store.batch_put_from_multi_buffers(
@@ -1103,6 +1160,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     status="partial_failure" if failed_indices else "ok",
                     num_failed_keys=len(failed_indices),
                 )
+                _m_put_ms = (time.perf_counter() - put_start) * 1000
                 failed_codes = {res[i] for i in failed_indices}
                 if failed_indices:
                     logger.warning(
@@ -1124,6 +1182,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         "batches for request %s until a later store batch succeeds",
                         req_id,
                     )
+
+            for i in failed_indices:
+                _g = group_indices[i]
+                _grp_failed[_g] = _grp_failed.get(_g, 0) + 1
 
             if (
                 not put_had_exception
@@ -1202,6 +1264,30 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if self.enable_kv_event and stored_events:
                 self.update_kv_event(stored_events)
         finally:
+            if envs.VLLM_KV_METRIC_LOG:
+                logger.info(
+                    "KV_SAVE_METRIC req=%s token_len=%d keys=%d bytes=%d "
+                    "total_ms=%.2f key_build_ms=%.2f exists_ms=%.2f "
+                    "gpu_sync_ms=%.2f put_ms=%.2f",
+                    req_id,
+                    checkpoint_len,
+                    _m_keys,
+                    _m_bytes,
+                    (time.perf_counter() - _m_start) * 1000,
+                    _m_key_build_ms,
+                    _m_exists_ms,
+                    _m_gpu_sync_ms,
+                    _m_put_ms,
+                )
+                _log_kv_metric_grp(
+                    "KV_SAVE_METRIC_GRP",
+                    req_id,
+                    _grp_keys,
+                    _grp_bytes,
+                    _grp_failed,
+                    self.group_specs,
+                    _m_put_ms,
+                )
             if save_completed:
                 self._record_saved_offset(req_meta, checkpoint_len)
             if self.enable_kv_event and available_token_len:
@@ -1231,6 +1317,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         request_queue: queue.Queue[Any] | None = None,
         group_participates: Sequence[bool] | None = None,
         is_hma_required: bool = False,
+        group_specs: Sequence[tuple[str, int]] | None = None,
     ):
         super().__init__(
             store,
@@ -1241,6 +1328,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             name="KVCacheStoreRecvingThread",
             record_operation=record_operation,
             request_queue=request_queue,
+            group_specs=group_specs,
         )
         self.group_participates = (
             list(group_participates)
@@ -1293,6 +1381,14 @@ class KVCacheStoreRecvingThread(KVTransferThread):
     def _handle_request(self, req_meta: ReqMeta):
         token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
         req_id = req_meta.req_id
+        _m_start = time.perf_counter()
+        _m_key_build_start = _m_start
+        _m_store_get_ms = 0.0
+        _m_bytes = 0
+        _grp_keys: dict[int, int] = {}
+        _grp_bytes: dict[int, int] = {}
+        _grp_failed: dict[int, int] = {}
+        key_group_ids: list[int] = []
         mask_num = (
             req_meta.load_spec.vllm_cached_tokens  # type: ignore[union-attr]
             // self.block_size
@@ -1319,6 +1415,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             mask = load_mask_per_group[g_idx]
             chunks: list[tuple[int, int]] = []
             store_shard_ids: list[StoreShardId] = []
+            key_base = len(key_list)
             for start, end, block_hash in db.process_tokens(
                 token_len,
                 req_meta.block_hashes,
@@ -1346,8 +1443,21 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             addr_list.extend(g_addrs)
             size_list.extend(g_sizes)
             block_id_list.extend(g_block_ids)
+            _num_group_keys = len(key_list) - key_base
+            key_group_ids.extend([g_idx] * _num_group_keys)
+            _grp_keys[g_idx] = _grp_keys.get(g_idx, 0) + _num_group_keys
+            _grp_bytes[g_idx] = _grp_bytes.get(g_idx, 0) + _sum_batch_bytes(g_sizes)
 
         if not key_list:
+            if envs.VLLM_KV_METRIC_LOG:
+                logger.info(
+                    "KV_GET_METRIC req=%s token_len=%d keys=0 total_ms=%.2f "
+                    "key_build_ms=%.2f store_get_ms=0.00",
+                    req_id,
+                    token_len,
+                    (time.perf_counter() - _m_start) * 1000,
+                    (time.perf_counter() - _m_key_build_start) * 1000,
+                )
             self.set_finished_request(req_id)
             self.request_queue.task_done()
             return
@@ -1358,6 +1468,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         addr_list_c = _rotate_list(addr_list, rotation)
         size_list_c = _rotate_list(size_list, rotation)
         block_id_list_c = _rotate_list(block_id_list, rotation)
+        group_ids_c = _rotate_list(key_group_ids, rotation)
+        _m_key_build_ms = (time.perf_counter() - _m_key_build_start) * 1000
 
         load_batches = [
             (
@@ -1420,6 +1532,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         current_batch_keys: list[str] = key_list_c
         current_batch_block_ids: list[int] = block_id_list_c
         batch_bytes = 0
+        _batch_offset = 0
         try:
             for (
                 batch_keys,
@@ -1430,6 +1543,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 current_batch_keys = batch_keys
                 current_batch_block_ids = batch_block_ids
                 batch_bytes = _sum_batch_bytes(batch_sizes)
+                batch_group_ids = group_ids_c[
+                    _batch_offset : _batch_offset + len(batch_keys)
+                ]
+                _batch_offset += len(batch_keys)
                 tiers_by_key: dict[str, str] | None = None
                 if envs.VLLM_MOONCAKE_STORE_TIER_LOG:
                     tiers_by_key = _get_replica_tiers_by_key(self.store, batch_keys)
@@ -1438,6 +1555,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 res = self.store.batch_get_into_multi_buffers(
                     batch_keys, batch_addrs, batch_sizes
                 )
+                _m_store_get_ms += (time.perf_counter() - load_get_start) * 1000
+                _m_bytes += batch_bytes
                 if tiers_by_key is not None:
                     _log_mooncake_load_tier_summary(
                         req_id, batch_keys, res, tiers_by_key
@@ -1449,6 +1568,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     )
                     if value < 0
                 ]
+                for value, g in zip(res, batch_group_ids, strict=True):
+                    if value < 0:
+                        _grp_failed[g] = _grp_failed.get(g, 0) + 1
                 self._record_operation(
                     "load_get",
                     load_get_start,
@@ -1485,6 +1607,27 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 e,
             )
 
+        if envs.VLLM_KV_METRIC_LOG:
+            logger.info(
+                "KV_GET_METRIC req=%s token_len=%d keys=%d bytes=%d "
+                "total_ms=%.2f key_build_ms=%.2f store_get_ms=%.2f",
+                req_id,
+                token_len,
+                len(key_list_c),
+                _m_bytes,
+                (time.perf_counter() - _m_start) * 1000,
+                _m_key_build_ms,
+                _m_store_get_ms,
+            )
+            _log_kv_metric_grp(
+                "KV_GET_METRIC_GRP",
+                req_id,
+                _grp_keys,
+                _grp_bytes,
+                _grp_failed,
+                self.group_specs,
+                _m_store_get_ms,
+            )
         self.set_finished_request(req_id)
         self.request_queue.task_done()
 
@@ -2247,6 +2390,13 @@ class MooncakeStoreWorker:
                     group.kv_cache_spec.prefix_cacheable
                     for group in self._kv_cache_groups
                 ],
+                group_specs=[
+                    (
+                        type(group.kv_cache_spec).__name__,
+                        group.kv_cache_spec.block_size,
+                    )
+                    for group in self._kv_cache_groups
+                ],
             )
             self.kv_send_thread.start()
 
@@ -2269,6 +2419,13 @@ class MooncakeStoreWorker:
                     for group in self._kv_cache_groups
                 ],
                 is_hma_required=self._is_hma_required,
+                group_specs=[
+                    (
+                        type(group.kv_cache_spec).__name__,
+                        group.kv_cache_spec.block_size,
+                    )
+                    for group in self._kv_cache_groups
+                ],
             )
             recv_thread.name = f"KVCacheStoreRecvingThread-{i}"
             recv_thread.start()
@@ -2474,6 +2631,10 @@ class MooncakeStoreWorker:
         if not block_hashes or token_len <= 0:
             return MooncakeLookupResult(0)
 
+        _m_start = time.perf_counter()
+        _m_key_build_start = _m_start
+        _m_exists_ms = 0.0
+
         # Build per-(group, hash) candidate keys expanded across rank namespaces.
         # candidate_meta stores (group, hash_bytes, end_token) for each key slice.
         candidate_keys: list[str] = []
@@ -2505,6 +2666,8 @@ class MooncakeStoreWorker:
                     )
                 candidate_meta.append((g_idx, bytes(h), end_token))
 
+        _m_key_build_ms = (time.perf_counter() - _m_key_build_start) * 1000
+
         if not candidate_keys:
             return MooncakeLookupResult(0)
 
@@ -2521,6 +2684,7 @@ class MooncakeStoreWorker:
                 time.perf_counter() - lookup_start,
                 len(candidate_keys),
             )
+            _m_exists_ms = (time.perf_counter() - lookup_start) * 1000
         except Exception as e:
             self._record_kv_connector_operation(
                 "lookup_exists",
@@ -2557,6 +2721,17 @@ class MooncakeStoreWorker:
         hit, load_masks = self._longest_hit(
             num_tokens, token_len, block_hashes, exists_set
         )
+        if envs.VLLM_KV_METRIC_LOG:
+            logger.info(
+                "KV_LOOKUP_METRIC tokens=%d keys=%d hit=%d total_ms=%.2f "
+                "key_build_ms=%.2f exists_ms=%.2f",
+                num_tokens,
+                len(candidate_keys),
+                hit.hit_length,
+                (time.perf_counter() - _m_start) * 1000,
+                _m_key_build_ms,
+                _m_exists_ms,
+            )
         if self._selective_lease is None:
             return hit
         return self._selective_lease.lease_hit(

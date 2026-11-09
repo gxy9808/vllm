@@ -26,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
@@ -515,6 +516,8 @@ class Scheduler(SchedulerInterface):
         )
         self._kv_fetch_counts: dict[str, int] = dict.fromkeys(KV_FETCH_STAGES, 0)
         self._aborted_kv_loads: set[str] = set()
+        self._kv_metric_load_start: dict[Request, float] = {}
+        self._kv_metric_load_done: dict[Request, float] = {}
 
     def _drafts_unused(
         self, request: Request, num_computed_tokens: int, num_new_tokens: int
@@ -1603,6 +1606,7 @@ class Scheduler(SchedulerInterface):
                         )
                     self._reserve_parked(request)
                     self._set_kv_fetch_stage(request, KV_FETCH_IN_PROGRESS)
+                    self._kv_metric_load_start[request] = time.perf_counter()
                     skip_request(request_queue)
                     continue
 
@@ -1636,6 +1640,13 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 self._set_kv_fetch_stage(request, None)
+                load_done = self._kv_metric_load_done.pop(request, None)
+                if load_done is not None and envs.VLLM_KV_METRIC_LOG:
+                    logger.info(
+                        "KV_LOADED_TO_SCHEDULED req=%s wait_ms=%.2f",
+                        request.request_id,
+                        (time.perf_counter() - load_done) * 1000,
+                    )
                 drafts_needed = drafts_needed or not self._drafts_unused(
                     request, num_computed_tokens, num_new_tokens
                 )
@@ -3177,6 +3188,8 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         self._unreserve_parked(request)
         self._set_kv_fetch_stage(request, None)
+        self._kv_metric_load_start.pop(request, None)
+        self._kv_metric_load_done.pop(request, None)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
         # EC Connector: mirror the KV hook. The contract requires firing
@@ -3723,6 +3736,15 @@ class Scheduler(SchedulerInterface):
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
                 self._set_kv_fetch_stage(req, KV_FETCH_COMPLETED_WAITING)
+                if envs.VLLM_KV_METRIC_LOG:
+                    load_start = self._kv_metric_load_start.pop(req, None)
+                    if load_start is not None:
+                        self._kv_metric_load_done[req] = time.perf_counter()
+                        logger.info(
+                            "KV_LOAD_WAIT req=%s load_ms=%.2f",
+                            req_id,
+                            (self._kv_metric_load_done[req] - load_start) * 1000,
+                        )
             else:
                 assert RequestStatus.is_finished(req.status)
                 self._aborted_kv_loads.discard(req_id)
